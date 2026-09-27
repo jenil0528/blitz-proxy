@@ -148,18 +148,32 @@ function translateUserMessage(msg, toolIdMap) {
     });
   }
 
-  // Other content blocks → user message
+  // Other content blocks → user message (text + vision parts)
   if (otherBlocks.length > 0) {
     const textParts = [];
+    const imageParts = [];
     for (const block of otherBlocks) {
       if (block.type === 'text') {
         textParts.push(block.text);
-      } else if (block.type === 'image') {
-        // Convert Anthropic image to OpenAI vision format
-        textParts.push('[Image content provided]');
+      } else if (block.type === 'image' && block.source) {
+        // Anthropic image → OpenAI image_url (base64 data URL or remote URL)
+        if (block.source.type === 'base64' && block.source.data) {
+          imageParts.push({
+            type: 'image_url',
+            image_url: { url: `data:${block.source.media_type || 'image/png'};base64,${block.source.data}` },
+          });
+        } else if (block.source.type === 'url' && block.source.url) {
+          imageParts.push({ type: 'image_url', image_url: { url: block.source.url } });
+        }
       }
     }
-    if (textParts.length > 0) {
+
+    if (imageParts.length > 0) {
+      const parts = [];
+      if (textParts.length > 0) parts.push({ type: 'text', text: textParts.join('\n') });
+      parts.push(...imageParts);
+      results.push({ role: 'user', content: parts });
+    } else if (textParts.length > 0) {
       results.push({ role: 'user', content: textParts.join('\n') });
     }
   }
@@ -182,6 +196,10 @@ function translateAssistantMessage(msg, toolIdMap) {
   const textParts = [];
 
   for (const block of msg.content) {
+    if (block.type === 'thinking' || block.type === 'redacted_thinking') {
+      // Reasoning history is not forwarded to OpenAI-compatible providers
+      continue;
+    }
     if (block.type === 'text') {
       textParts.push(block.text);
     } else if (block.type === 'tool_use') {
@@ -266,6 +284,11 @@ export function translateResponse(openaiRes, toolIdMap, requestModel) {
 
   const message = choice.message;
   const content = [];
+
+  // Provider reasoning (e.g. DeepSeek R1 reasoning_content) → thinking block
+  if (message.reasoning_content) {
+    content.push({ type: 'thinking', thinking: message.reasoning_content, signature: 'blitzproxy' });
+  }
 
   // Text content
   if (message.content) {

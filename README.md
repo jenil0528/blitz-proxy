@@ -1,420 +1,329 @@
-![version](https://img.shields.io/badge/version-1.1.0-blue) ![node](https://img.shields.io/badge/node-18%2B-green) ![zero deps](https://img.shields.io/badge/dependencies-zero-brightgreen) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Mac%20%7C%20Linux-lightgrey) ![CI](https://github.com/jenil0528/claude-code-proxy/actions/workflows/ci.yml/badge.svg)
+![version](https://img.shields.io/badge/version-2.0.0-blue) ![node](https://img.shields.io/badge/node-18%2B-green) ![zero deps](https://img.shields.io/badge/dependencies-zero-brightgreen) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Mac%20%7C%20Linux-lightgrey) ![tests](https://img.shields.io/badge/tests-184%20passed%20%2F%2013%20suites-brightgreen) ![CI](https://github.com/jenil0528/claude-code-proxy/actions/workflows/ci.yml/badge.svg)
 
 # ⚡ BlitzProxy
 
-**Use Claude Code with ANY LLM provider — DeepSeek, NVIDIA, Groq, Ollama, and more.**
+**A local-first, multi-provider AI gateway for Claude Code, OpenCode, Codex, and any OpenAI/Anthropic-compatible client.**
 
-Zero dependencies. Pure Node.js. Everything managed from terminal.
+Zero runtime dependencies. Pure Node.js. Your keys stay in your OS keyring — your prompts never leave your machine except to the provider you chose.
 
 ```
-Claude Code  ──→  BlitzProxy (localhost:4819)  ──→  Any OpenAI-compatible API
-             Anthropic Messages API            OpenAI Chat Completions API
+Claude Code ─┐
+OpenCode    ─┤→  BlitzProxy (127.0.0.1:4819)  →  Provider registry  →  NVIDIA / Groq / OpenRouter /
+Codex CLI   ─┤        Anthropic + OpenAI APIs        with fallback         DeepSeek / Gemini / Ollama / …
+any client  ─┘        + secure keyring             + key rotation          + your own endpoints
 ```
+
+BlitzProxy works perfectly with a single provider — routing, fallback, health, and stats are all optional layers you can ignore.
 
 ---
 
-## 📋 What is BlitzProxy?
+## Features
 
-BlitzProxy is a local proxy server that sits between **Claude Code** (Anthropic's CLI) and any **OpenAI-compatible LLM provider**. It translates Anthropic's API format into OpenAI's format in real-time, so you can use Claude Code with providers like DeepSeek, NVIDIA NIM, Groq, Ollama, and others.
+- **Speaks both APIs natively** — Anthropic Messages (`/v1/messages`) *and* OpenAI Chat Completions + Responses (`/v1/chat/completions`, `/v1/responses`), translated in real time to any provider
+- **Multiple keys per provider, automatic rotation** — store as many keys as you like per provider; when one is rejected (401/403), the next key is tried *before* any provider failover
+- **Interactive model picker** — `blitz model` lists the catalog and lets you select a model right there (or use fuzzy search, `provider/model` syntax, or a live list from the provider)
+- **Honest key validation** — `blitz validate` confirms a key with a real 1-token inference request, because some `/models` endpoints (NVIDIA's included) accept *any* key
+- **Multi-provider fallback** — rate limits, timeouts, 5xx, network errors, context overflow, and retired models fail over to the next provider *before the first byte reaches your client*
+- **Automatic routing** — `blitz auto` ranks providers per request by live health, capability match, and priority
+- **Health that reflects reality** — real request outcomes (401/403/429/5xx) are pinned over cheap probes, so the dashboard and auto-routing never trust a lying endpoint
+- **Secure by default** — keys in the OS keyring (Windows DPAPI / macOS Keychain / Linux Secret Service), masked everywhere, redacted from every log, local-only binding, token-gated admin
+- **Zero dependencies** — no `npm install`, no supply chain, Node.js 18+ is the only requirement
+- **Invisible background operation (Windows)** — the proxy and all its helper processes (keyring, process management) run fully hidden: no console windows flash on your screen while you work
 
-**Why?** Claude Code normally requires an Anthropic API key ($$). BlitzProxy lets you use cheaper or free alternatives instead.
-
----
-
-## 🚀 Quick Start (Fresh Setup)
-
-### Prerequisites
-
-- **Node.js 18+** — Download from [nodejs.org](https://nodejs.org) if you don't have it
-- **Claude Code CLI** — Install with `npm install -g @anthropic-ai/claude-code`
-- No `npm install` needed for BlitzProxy — it has zero dependencies!
-
-### Step 1: Get an API Key
-
-You need an API key from any supported provider. Here are some free options:
-
-| Provider | Free Tier | Get Key At |
-|----------|-----------|------------|
-| NVIDIA NIM | ✅ Free credits on signup | [build.nvidia.com](https://build.nvidia.com) |
-| Groq | ✅ Generous free tier | [console.groq.com](https://console.groq.com) |
-| GitHub Models | ✅ Free with GitHub account | [github.com/marketplace/models](https://github.com/marketplace/models) |
-| Cerebras | ✅ Free tier | [cloud.cerebras.ai](https://cloud.cerebras.ai) |
-| DeepSeek | 💰 Very cheap | [platform.deepseek.com](https://platform.deepseek.com) |
-| OpenRouter | 💰 Many free models | [openrouter.ai](https://openrouter.ai) |
-| Ollama | ✅ 100% Free (local) | [ollama.com](https://ollama.com) |
-
-### Step 2: One-Time Setup
-
-Open a terminal in the BlitzProxy folder and run:
-
-```powershell
-# Windows
-.\setup.bat
-```
-
-This does three things:
-1. Sets `ANTHROPIC_BASE_URL=http://localhost:4819` permanently (tells Claude Code to use BlitzProxy)
-2. Sets `ANTHROPIC_API_KEY=blitz` permanently (a dummy key, BlitzProxy handles the real one)
-3. Adds `blitz` command to your PATH so you can run it from anywhere
-
-> **After setup, close and reopen your terminal** for the changes to take effect.
-
-### 🍎 Mac / Linux Quick Start
+## Quick Start
 
 ```bash
-# One-time setup
-bash setup.sh
+# 1. install the `blitz` command (see below for your OS)
+# 2. add a key — prefix detection picks the provider automatically
+blitz add nvapi-xxxxxxxx
 
-# Add your API key
-blitz add YOUR_API_KEY_HERE
-
-# Start
+# 3. start the proxy + launch Claude Code in one command
 blitz
 ```
 
-`setup.sh` will:
-1. Append `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY` to your `~/.zshrc` or `~/.bashrc`
-2. Create a `blitz` symlink at `/usr/local/bin/blitz`
-3. Print instructions to source your shell config
+That's it. Claude Code now runs on your choice of 16 built-in providers (or your own endpoint) with fallback, key rotation, and usage stats.
 
-### Step 3: Add Your API Key
+## Installation
 
-```powershell
-blitz add YOUR_API_KEY_HERE
-```
+Requires **Node.js 18+**. No `npm install` — the project has zero dependencies.
 
-That's it! BlitzProxy **auto-detects** the provider from your key prefix. Examples:
+### Windows
 
 ```powershell
-# NVIDIA NIM key (starts with nvapi-) → auto-detected
-blitz add nvapi-abc123def456
-
-# Groq key (starts with gsk_) → auto-detected
-blitz add gsk_xyz789abc
-
-# sk- keys (DeepSeek & OpenAI both use this prefix)
-# BlitzProxy will ask you to choose:
-blitz add sk-mykey123
-# ⚠ This key starts with "sk-", which is used by multiple providers.
-# Which provider is this key for?
-#   🔮 1) DeepSeek
-#   🤖 2) OpenAI
-# Enter choice (1-2): _
-
-# You can also give it a name
-blitz add nvapi-abc123def456 "My NVIDIA Free Tier"
+# from the BlitzProxy folder
+powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-### Step 4: Start Using
+The safe installer:
+- creates a `blitz` command shim in `%LOCALAPPDATA%\BlitzProxy`
+- adds it to your **user** PATH via the registry API (no `setx` truncation risk)
+- backs up an existing `config.json`
+- **does not** permanently change `ANTHROPIC_*` (use `blitz run claude` instead)
 
-```powershell
-blitz
-```
+Open a **new terminal** afterwards so the PATH refresh applies. Uninstall: `powershell -File uninstall.ps1` (add `-Purge` to also remove stored keys and stats).
 
-This starts the proxy and launches Claude Code automatically. Done! 🎉
-
----
-
-## 🛠️ CLI Commands Reference
-
-All management is done from the terminal. No UI, no browser — just commands.
-
-### Starting
-
-```powershell
-blitz                # Start proxy + launch Claude Code
-```
-
-### Managing API Keys
-
-You can save multiple API keys and switch between them instantly.
-
-```powershell
-blitz add API_KEY [NAME]   # Add a new API key (provider auto-detected)
-blitz keys                 # List all saved keys
-blitz switch INDEX         # Switch to key by number (#)
-blitz switch NAME          # Switch to key by name (partial match works)
-blitz rm INDEX             # Delete key by number
-blitz rm NAME              # Delete by name
-```
-
-**Example workflow:**
-
-```powershell
-# Add multiple keys
-blitz add nvapi-abc123 "NVIDIA Free"
-blitz add gsk_xyz789 "Groq Fast"
-blitz add sk-deep456 "DeepSeek Cheap"
-
-# See all keys (● = active)
-blitz keys
-#   # │ Provider        │ Name                │ Key
-#   ──┼─────────────────┼─────────────────────┼──────────────
-# ●  1 │ NVIDIA NIM      │ NVIDIA Free         │ nvapi-••••c123
-#    2 │ Groq            │ Groq Fast           │ gsk_xy••••z789
-#    3 │ DeepSeek        │ DeepSeek Cheap      │ sk-de••••p456
-
-# Switch to Groq (by number)
-blitz switch 2
-# ⚡ Switched to: Groq Fast
-#    Provider: Groq  •  Timeout: 30s
-
-# Switch by name (partial match)
-blitz switch deep
-# ⚡ Switched to: DeepSeek Cheap
-
-# Delete a key
-blitz rm 3
-```
-
-### Changing Model
-
-```powershell
-blitz model                # List available models for current provider
-blitz model NAME           # Set a specific model
-blitz model INDEX          # Set by number from the list
-```
-
-**Example:**
-
-```powershell
-# See available models
-blitz model
-#   1) meta/llama-3.3-70b-instruct
-#   2) meta/llama-3.1-405b-instruct
-#   ...
-# ● 11) deepseek-ai/deepseek-v4-pro
-
-# Switch to a different model
-blitz model 1
-# ✓ Model set: meta/llama-3.3-70b-instruct
-
-# Or type part of the name
-blitz model deepseek-r1
-# ✓ Model set: deepseek-ai/deepseek-r1
-```
-
-### Changing Provider
-
-```powershell
-blitz provider             # List all providers with timeouts
-blitz provider NAME        # Switch to a provider
-```
-
-**Example:**
-
-```powershell
-blitz provider
-# ● 🟢 NVIDIA NIM       timeout=300s  Free credits on signup
-#   ⚡ Groq             timeout=30s   Ultra-fast inference
-#   🔮 DeepSeek         timeout=120s  Extremely affordable
-#   🤖 OpenAI           timeout=120s  OpenAI official API
-#   🦙 Ollama (Local)   timeout=600s  Run models locally
-#   ...
-
-blitz provider groq
-# ✓ Provider: Groq
-#    Model: llama-3.3-70b-versatile  •  Timeout: 30s
-```
-
-### Testing & Status
-
-```powershell
-blitz test                # Test connection to current provider
-blitz status              # Show current configuration
-```
-
-### Logs
-
-```powershell
-blitz logs             # Show last 50 entries with colored output
-blitz logs --live      # Stream new entries in real-time (like tail -f)
-blitz logs --clear     # Wipe the log file
-```
-
-Log format:
-```
-[2026-04-28 14:32:01] POST /v1/messages → 200 OK (1243ms) deepseek-v4-pro
-[2026-04-28 14:32:01] ERROR 429 rate_limit_exceeded
-```
-
-Colors: 🟢 green = 200 OK, 🟡 yellow = 4xx, 🔴 red = 5xx/errors. Log auto-rotates to `blitz.log.old` at 5MB.
-
----
-
-## ⏱️ Auto-Timeout
-
-BlitzProxy automatically sets the right timeout for each provider — you never need to configure this manually:
-
-| Provider | Timeout | Why |
-|----------|---------|-----|
-| Groq | 30s | Ultra-fast inference |
-| Cerebras | 30s | Blazing fast |
-| GitHub Models | 60s | Generally fast |
-| OpenRouter | 120s | Varies by model |
-| DeepSeek | 120s | Standard |
-| OpenAI | 120s | Standard |
-| Together AI | 120s | Standard |
-| Hugging Face | 120s | Standard |
-| NVIDIA NIM | 300s | Cold-start on serverless GPUs |
-| Ollama | 600s | Depends on your hardware |
-
-When you switch keys or providers, the timeout updates automatically.
-
----
-
-## 🗂️ Project Structure
-
-```
-claude-code-proxy/
-├── blitz.bat          # Entry point — run "blitz" from anywhere (Windows)
-├── blitz.sh           # Entry point — run "blitz" from anywhere (Mac/Linux)
-├── cli.js             # CLI tool (add/keys/switch/rm/model/provider/test/logs)
-├── server.js          # Proxy server (translates Anthropic → OpenAI)
-├── setup.bat          # One-time setup (Windows)
-├── setup.sh           # One-time setup (Mac/Linux)
-├── start.bat          # Alternative: start proxy only (without Claude)
-├── config.json        # Auto-created — stores your keys & settings
-├── blitz.log          # Request log (auto-created, auto-rotated at 5MB)
-├── .env               # API key (auto-created from .env.example)
-├── .env.example       # Template
-├── test/
-│   ├── index.js               # Test runner (npm test)
-│   ├── translator.test.js     # Unit tests: request/response translation
-│   └── stream.test.js         # Unit tests: SSE stream translation
-└── src/
-    ├── config.js              # Configuration loading & key management
-    ├── connection.js          # Fetch wrapper with connect/read timeouts
-    ├── providers.js           # Provider definitions (URLs, models, timeouts)
-    ├── translator.js          # Anthropic ↔ OpenAI request/response translation
-    ├── stream-translator.js   # SSE stream translation
-    ├── retry.js               # Automatic retry with exponential backoff
-    └── logger.js              # Logging utilities
-```
-
----
-
-## 🔑 Supported Providers & Key Prefixes
-
-BlitzProxy auto-detects the provider from your API key prefix:
-
-| Provider | Key Prefix | Auto-Detected? |
-|----------|-----------|----------------|
-| NVIDIA NIM | `nvapi-` | ✅ Yes |
-| Groq | `gsk_` | ✅ Yes |
-| OpenRouter | `sk-or-` | ✅ Yes |
-| Cerebras | `csk-` | ✅ Yes |
-| GitHub Models | `github_pat_` | ✅ Yes |
-| Hugging Face | `hf_` | ✅ Yes |
-| DeepSeek | `sk-` | ⚠️ Also matches OpenAI — blitz will ask you to confirm |
-| OpenAI | `sk-` | ⚠️ Also matches DeepSeek — blitz will ask you to confirm |
-| Together AI | *(generic)* | Set manually: `blitz provider together` |
-| Ollama | *(no key)* | Set manually: `blitz provider ollama` |
-| Custom | *(any)* | Set manually: `blitz provider custom` |
-
----
-
-## ❓ Troubleshooting
-
-### "blitz" command not found
-```powershell
-# Option 1: Re-run setup
-.\setup.bat
-
-# Option 2: Add to PATH manually (current session)
-$env:PATH += ";J:\claude proxy"
-
-# Option 3: Run directly
-& "J:\claude proxy\blitz.bat" help
-```
-
-### Connection timeout
-```powershell
-# Check your current config
-blitz status
-
-# Test the connection
-blitz test
-
-# If using NVIDIA NIM, first request may take 2-5 min (cold start)
-# The 300s timeout handles this automatically
-```
-
-### Wrong model or provider
-```powershell
-# See what's active
-blitz status
-
-# Fix provider
-blitz provider nvidia
-
-# Fix model
-blitz model deepseek-ai/deepseek-v4-pro
-```
-
-### Claude Code says "invalid API key"
-```powershell
-# Make sure env vars are set
-echo $env:ANTHROPIC_BASE_URL
-# Should show: http://localhost:4819
-
-echo $env:ANTHROPIC_API_KEY
-# Should show: blitz
-
-# If not, run setup again
-.\setup.bat
-```
-
-### PowerShell error: "The '<' operator is reserved for future use"
-If you see this error, it's because you included brackets like `<` and `>` in your command. **Do not include the brackets.**
-- ❌ `blitz add <nvapi-abc123>`
-- ✅ `blitz add nvapi-abc123`
-- ✅ `blitz add "nvapi-abc123"` (use quotes if the key has special characters)
-
----
-
-## 🧪 Development & Testing
-
-BlitzProxy has zero runtime dependencies. Tests are included and run with:
+### Linux
 
 ```bash
-npm test
+bash setup.sh        # installs a `blitz` wrapper at /usr/local/bin/blitz (no rc-file changes)
 ```
 
-The test suite covers:
-- Request translation (Anthropic → OpenAI messages, tools, tool_choice, stop_sequences)
-- Response translation (OpenAI → Anthropic content blocks, stop reasons, usage)
-- Streaming SSE translation (text deltas, single/multi tool calls, no duplicate events)
+Uninstall: `bash uninstall.sh` (add `--purge` to also remove stored keys/stats).
 
-A CI workflow (`.github/workflows/ci.yml`) runs the test suite automatically on every push and pull request across Node.js 18, 20, and 22.
+### macOS
 
----
+Same as Linux: `bash setup.sh` — keys are stored in the **macOS Keychain** automatically.
 
-## 📝 Notes
+## API Keys
 
-- **Model quality matters**: Claude Code uses tool calling heavily. Models like DeepSeek V4 Pro, Llama 3.3 70B, and Qwen 2.5 Coder handle this well. Smaller models may struggle.
-- **Rate limits**: The proxy includes automatic retry with exponential backoff (3 retries by default).
-- **Multiple keys**: Save keys from different providers and switch instantly — great for testing or when one provider is slow.
-- **Config file**: All settings are saved in `config.json` (auto-created). You can edit it manually if needed, but the CLI is easier.
-- This is a development tool, not meant for production use.
-
----
-
-## 🏁 TL;DR
-
-```powershell
-# First time (once ever)
-.\setup.bat
-blitz add YOUR_API_KEY
-
-# Every time
-blitz
+```bash
+blitz add nvapi-xxxxxxxx           # auto-detects NVIDIA, stores in OS keyring
+blitz add gsk_xxxxxxxx "My Groq"   # optional friendly name
+blitz add                          # no key on the command line → hidden prompt
+                                    # (avoids leaving the key in shell history)
 ```
 
----
+Keys are stored in your OS secure storage — **Windows DPAPI**, **macOS Keychain**, or **Linux Secret Service** — with a loudly-warned, `0600`-permission plaintext fallback only when the OS store is unavailable. Keys are masked everywhere (`nvapi-••••a82f`), never logged, never written to `.env`, never committed.
 
-## 👤 Author & Support
+### Multiple keys per provider
 
-Created by **Jenil Patel**  
-📧 Email: [jenil8736@gmail.com](mailto:jenil8736@gmail.com)  
-🚀 Part of the **BlitzProxy** project.
+Add as many keys as you want for the same provider — useful when one runs out of free credits or gets rate-limited:
+
+```bash
+blitz add nvapi-first-key
+blitz add nvapi-second-key
+# → NVIDIA NIM now has 2 keys — they rotate automatically when one is rejected
+```
+
+When a request gets **401/403**, BlitzProxy tries the next key for the *same provider* before anything else. This is key rotation, not a provider failover — so it happens even with `fallbackOnAuthError` off, and a successful rotation never marks the provider unhealthy. When *every* key is rejected, the error tells you exactly which (masked) key failed and how to fix it:
+
+```
+Provider rejected authentication (HTTP 403) — the provider rejected key
+nvapi-••••6w-U; replace it with: blitz add <new-key>
+```
+
+### Managing keys
+
+```bash
+blitz keys          # list all keys (masked), shows rotation counts
+blitz switch 2      # make key #2 the active key
+blitz rm 1          # delete key #1
+blitz rm nvidia     # delete ALL keys for a provider
+blitz validate      # deep-validate the active provider's key with a REAL request
+blitz validate groq # …or any provider's
+```
+
+A key prefix is never treated as proof of validity — and neither is a `200` from `/models` (NVIDIA's model list is anonymous and answers 200 to *any* Bearer token). `blitz validate` therefore confirms the key with a minimal real inference request (costs at most one token) and surfaces the provider's own error detail:
+
+```
+✕ NVIDIA NIM: Provider rejected the key on a real request (HTTP 403: Authorization failed)
+```
+
+## Model Selection
+
+```bash
+blitz model                # interactive: numbered catalog → select a model right here
+blitz model glm            # fuzzy match (picks from matches, or prompts when ambiguous)
+blitz model 7              # set by list number
+blitz model nvidia/meta/llama-3.3-70b-instruct   # provider/model syntax (switches provider)
+blitz model --live         # fetch the provider's real model list — selectable too
+```
+
+The picker lists capabilities with every model (`tools vision reasoning 128k ctx`), marks the active one with `●`, and cancels cleanly with Enter. Non-interactive shells fall back to the classic numbered list.
+
+## Connect Clients
+
+### Claude Code
+
+```bash
+blitz                    # starts proxy + launches Claude Code (env for this process only)
+blitz run claude --resume # any claude flags pass through
+blitz shell              # a whole shell with the BlitzProxy environment
+```
+
+`blitz run` / `blitz shell` set the client env vars **for that process only** — your global environment is never hijacked:
+
+| Variable | Value |
+|---|---|
+| `ANTHROPIC_BASE_URL` | `http://127.0.0.1:4819` |
+| `ANTHROPIC_API_KEY` | your local BlitzProxy token |
+| `OPENAI_BASE_URL` | `http://127.0.0.1:4819/v1` |
+| `OPENAI_API_KEY` | your local BlitzProxy token |
+
+### Codex, OpenCode & other clients
+
+```bash
+blitz run codex     # OpenAI Codex CLI — uses the /v1/responses endpoint
+blitz run opencode  # OpenCode — uses /v1/chat/completions
+blitz run aider     # any OpenAI-compatible tool
+```
+
+Every endpoint gets the same routing, key rotation, fallback, stats, and cost tracking:
+
+| Endpoint | Used by | Format |
+|---|---|---|
+| `POST /v1/messages` | Claude Code, Anthropic SDKs | Anthropic Messages — streaming, tools, images, thinking/reasoning blocks, token usage |
+| `POST /v1/responses` | OpenAI Codex CLI | OpenAI **Responses API** — `response.*` SSE events, function-call round-trips, `response.failed` on mid-stream errors (never a fake completion) |
+| `POST /v1/chat/completions` | OpenCode, Aider, Continue, LangChain, … | OpenAI Chat Completions (passthrough) |
+| `GET /v1/models` | all | Claude-compat + configured provider models |
+| `GET /health` | status checks | public, no internals |
+
+## Routing & Reliability
+
+**Manual mode (default):** your active provider first, then the fallback chain:
+
+```bash
+blitz fallback add groq
+blitz fallback add openrouter
+blitz fallback list        # nvidia → groq → openrouter
+```
+
+Failover happens for **rate limits, timeouts, 5xx, network errors, context overflow, and missing models** — never for invalid requests or TLS errors, and **not for auth errors by default** (`blitz config set fallbackOnAuthError true` to opt in). The one exception: a rejected key rotates to your next key for the same provider first (see above). Failover only ever happens **before the first streamed byte**; once streaming has begun, a provider failure produces an explicit `error` event instead of a silently truncated response.
+
+**Automatic mode:** `blitz auto` — ranks available providers per request by health snapshot, capability match (tools/vision/context window), and a priority list. Capability-aware routing means a tools request never silently lands on a tool-less model when an alternative exists.
+
+**Profiles** — named chains for different work styles:
+
+```bash
+blitz profile list
+blitz profile set coding    # nvidia → deepseek → openrouter → groq
+blitz profile set fast      # groq → cerebras
+blitz profile set free      # free tiers first
+blitz profile set local     # ollama ONLY — never contacts cloud providers
+blitz profile add mine --chain "nvidia,deepseek/deepseek-chat" --desc="my chain"
+blitz profile off
+```
+
+## Provider Health
+
+```bash
+blitz health         # live checks per provider (deep: verifies with a real request)
+```
+
+Health has two layers:
+- **Cheap probes** (`/models`) with a TTL cache — provider APIs are never spammed
+- **Passive marks from real traffic** — a live 401/403/429/5xx pins the provider as `AUTH-FAILED` / `RATE-LIMITED` / `UNAVAILABLE` for a hold window (auth: 5 min), overriding any probe result. The dashboard and auto-routing trust real outcomes over probes — so a provider that answers health checks fine but rejects your requests is shown as broken, because it is.
+
+## Dashboard & Stats
+
+```bash
+blitz dashboard    # → http://127.0.0.1:4819/dashboard?token=<your token>
+blitz stats        # per-provider request counts, success/fail, latency, tokens, estimated cost
+blitz logs --live  # tail the request log (routes, statuses, latency — never prompts)
+```
+
+The dashboard is local-only, token-gated, and built with zero frontend dependencies: provider health, current routing, request counts, errors, fallback and rotation events, and clearly-labeled **pricing estimates** (unknown pricing shows `n/a` — never invented). Stats are aggregates only: prompts and responses are never stored.
+
+## Security
+
+- Binds **127.0.0.1** by default (`blitz config set host 0.0.0.0` is the explicit opt-in for LAN use)
+- Auto-generated local token protects `/admin/*` and `/dashboard`; optional `blitz config set requireAuth true` extends it to `/v1/*`
+- Keys in the OS keyring, masked in every output, redacted from every log
+- No CORS wildcard — only same-machine browser origins
+- Privacy mode: `blitz privacy` — no request log, stats in-memory only
+- **No telemetry, ever.** No analytics code exists in this project.
+
+Details: [SECURITY.md](SECURITY.md).
+
+## Troubleshooting
+
+```bash
+blitz doctor     # checks Node, config, keyring, keys, port, env conflicts, client CLIs…
+```
+
+| Symptom | Fix |
+|---|---|
+| Every request returns 401/403 | Key revoked/expired — `blitz validate <provider>` confirms with a real request; then `blitz add <new-key>` |
+| Key added but provider still fails | `blitz keys` — an unrecognized key format lands under `custom` and never gets used for a named provider; re-add with `blitz add <key> --provider=<id>` |
+| `Port 4819 already in use` | `blitz stop`, or `blitz config set proxyPort 4818` |
+| `blitz` not found | re-run the installer, then open a **new** terminal |
+| NVIDIA first request slow | normal — serverless cold start; the NVIDIA timeout budget is 300s |
+| Wrong model for provider | `blitz model <provider/model>` or `blitz provider <name>` |
+| Provider 400 with "context" | request exceeds the model's window — enable a fallback with a larger context, or trim the request |
+
+## Provider Catalog
+
+| Provider | id | Key prefix | Notes |
+|---|---|---|---|
+| NVIDIA NIM | `nvidia` | `nvapi-` | free credits at build.nvidia.com; big model list |
+| Groq | `groq` | `gsk_` | ultra-fast inference, generous free tier |
+| OpenRouter | `openrouter` | `sk-or-` | gateway to 200+ models, many free |
+| DeepSeek | `deepseek` | `sk-` | extremely affordable, strong coding models |
+| OpenAI | `openai` | `sk-` | official API |
+| GitHub Models | `github` | `github_pat_` | free with a GitHub account |
+| Cerebras | `cerebras` | `csk-` | blazing fast |
+| Google Gemini | `gemini` | `AIza` | via its OpenAI-compatible endpoint |
+| Mistral | `mistral` | — | official API (set provider manually) |
+| xAI | `xai` | `xai-` | Grok models |
+| Together AI | `together` | — | huge catalog (set provider manually) |
+| Fireworks | `fireworks` | `fw_` | fast serving of open models |
+| SambaNova | `sambanova` | — | fast open-model inference |
+| Hugging Face | `huggingface` | `hf_` | router to many hosted models |
+| Ollama | `ollama` | none | local models — no key, no cloud |
+| Custom | `custom` | any | any OpenAI-compatible endpoint |
+
+Ambiguous `sk-` keys (DeepSeek vs OpenAI) prompt interactively. Custom endpoint:
+
+```bash
+blitz provider custom
+blitz config set customBaseUrl https://your-endpoint/v1
+```
+
+## Custom Providers & Plugins
+
+Define endpoints in `config.json` under `customProviders`, or drop a plugin file in `providers/` — adding a provider never requires touching the router:
+
+```js
+// providers/example.js
+export const id = 'example';
+export const name = 'Example';
+export const baseUrl = 'https://api.example.com/v1';
+export const defaultModel = 'example-large';
+export const requiresKey = true;
+```
+
+Drop it in `providers/`, restart, done. Full guide: [PROVIDERS.md](PROVIDERS.md).
+
+## Configuration
+
+`config.json` (auto-created, no secrets) + environment overrides as input only:
+
+| Variable | Effect |
+|---|---|
+| `API_KEY` | overrides the keyring for the active provider (power users) |
+| `PROVIDER` / `MODEL` | override provider/model selection |
+| `PROXY_PORT` / `BLITZ_HOST` | override port / bind host |
+| `TIMEOUT` | override provider timeouts |
+| `PRIVACY=true` | same as `blitz privacy` |
+
+Common settings:
+
+```bash
+blitz config set fallbackOnAuthError true   # allow auth-failure failover BETWEEN providers
+blitz config set requireAuth true           # token required for /v1/* too
+blitz config set proxyPort 4818
+```
+
+## Development
+
+```bash
+npm test        # 184 tests, 13 suites — mocked providers behind real HTTP servers, no real keys
+npm run lint    # syntax check over all sources
+npm run dev     # watch-mode server
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Test philosophy: no real API keys in tests, no fake assertions — mocked *upstream providers* behind real HTTP servers. Architecture deep-dive: [ARCHITECTURE.md](ARCHITECTURE.md).
+
+## Commands at a Glance
+
+| Area | Commands |
+|---|---|
+| Run | `blitz` · `blitz run <cmd>` · `blitz shell` · `blitz start/stop/restart/status` |
+| Keys | `blitz add` · `keys` · `switch` · `rm` · `validate` |
+| Providers & models | `blitz provider` · `model` · `test` |
+| Routing | `blitz auto` · `fallback` · `profile` |
+| Insight | `blitz health` · `stats` · `logs` · `dashboard` · `doctor` · `config` · `privacy` · `token` |
+
+## License
+
+MIT — see [LICENSE](LICENSE). Created by **Jenil Patel**.

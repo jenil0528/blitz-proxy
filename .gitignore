@@ -1,8 +1,16 @@
 # Secrets — never commit these
 .env
+.env.local
 config.json
+config.json.bak*
+*.key
+
+# Secret folders
+secrets/
+credentials/
 
 # Logs
+logs/
 blitz.log
 blitz.log.old
 

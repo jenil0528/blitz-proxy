@@ -306,6 +306,78 @@ test('message with both text and tool calls', () => {
   assert.equal(toolBlock.name, 'my_fn');
 });
 
+// ─── v2 additions ─────────────────────────────────────────────────────────────
+
+console.log('\ntranslateRequest — v2 (images, thinking)');
+
+test('image blocks become OpenAI image_url data URLs', () => {
+  const { body } = translateRequest({
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'what is this?' },
+        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: 'QUJD' } },
+      ],
+    }],
+  }, 'gpt-4o');
+
+  const userMsg = body.messages.find(m => m.role === 'user');
+  assert.ok(Array.isArray(userMsg.content), 'multimodal content must be an array');
+  const img = userMsg.content.find(p => p.type === 'image_url');
+  assert.ok(img, 'image_url part missing');
+  assert.equal(img.image_url.url, 'data:image/jpeg;base64,QUJD');
+  const txt = userMsg.content.find(p => p.type === 'text');
+  assert.equal(txt.text, 'what is this?');
+});
+
+test('image url sources are forwarded as-is', () => {
+  const { body } = translateRequest({
+    messages: [{
+      role: 'user',
+      content: [{ type: 'image', source: { type: 'url', url: 'https://example.com/cat.png' } }],
+    }],
+  }, 'gpt-4o');
+  const img = body.messages[0].content.find(p => p.type === 'image_url');
+  assert.equal(img.image_url.url, 'https://example.com/cat.png');
+});
+
+test('assistant thinking blocks are stripped (not forwarded)', () => {
+  const { body } = translateRequest({
+    messages: [
+      { role: 'user', content: 'hi' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'internal reasoning', signature: 'sig' },
+          { type: 'text', text: 'visible answer' },
+        ],
+      },
+      { role: 'user', content: 'continue' },
+    ],
+  }, 'gpt-4o');
+  const raw = JSON.stringify(body);
+  assert.ok(!raw.includes('internal reasoning'));
+  const assistant = body.messages.find(m => m.role === 'assistant');
+  assert.equal(assistant.content, 'visible answer');
+});
+
+console.log('\ntranslateResponse — v2 (reasoning)');
+
+test('reasoning_content becomes a thinking block before text', () => {
+  const result = translateResponse({
+    choices: [{
+      message: { role: 'assistant', reasoning_content: 'chain of thought', content: 'Answer' },
+      finish_reason: 'stop',
+    }],
+    usage: { prompt_tokens: 3, completion_tokens: 9 },
+  }, new Map(), 'm');
+  assert.equal(result.content[0].type, 'thinking');
+  assert.equal(result.content[0].thinking, 'chain of thought');
+  assert.equal(result.content[1].type, 'text');
+  assert.equal(result.content[1].text, 'Answer');
+  assert.equal(result.stop_reason, 'end_turn');
+});
+
 // ─── Summary ─────────────────────────────────────────────────────────────────
 
 console.log(`\n${passed + failed} tests — ${passed} passed, ${failed} failed\n`);

@@ -25,12 +25,12 @@ export async function translateStream(openaiStream, res, toolIdMap, requestModel
     currentBlockType: null,
     closedBlocks: new Set(),  // block indices that have already received content_block_stop
     toolCallBuffers: {},      // tcIndex -> { blockIndex, anthropicId, openaiId, name, arguments }
-    textBuffer: '',
     inputTokens: 0,
     outputTokens: 0,
     sentStart: false,
     sentStop: false,
     stopReason: 'end_turn',
+    errored: false,
   };
 
   // Send initial message_start event
@@ -86,10 +86,30 @@ export async function translateStream(openaiStream, res, toolIdMap, requestModel
     }
   } catch (err) {
     log.error('[Stream] Error processing stream:', err.message);
+    // Never fake a successful completion after a mid-stream failure —
+    // tell the client explicitly, then stop.
+    sendEvent(res, 'error', {
+      type: 'error',
+      error: { type: 'api_error', message: `Upstream stream failed: ${err.message}` },
+    });
+    state.errored = true;
+    try { res.end(); } catch { /* response may already be destroyed */ }
+    return {
+      inputTokens: state.inputTokens,
+      outputTokens: state.outputTokens,
+      stopReason: state.stopReason,
+      errored: true,
+    };
   }
 
   // Finalize: close any open content blocks + send message_stop
   finalizeStream(res, state, requestModel);
+  return {
+    inputTokens: state.inputTokens,
+    outputTokens: state.outputTokens,
+    stopReason: state.stopReason,
+    errored: false,
+  };
 }
 
 // ─── SSE Line Processing ─────────────────────────────────────────────────────
@@ -139,6 +159,25 @@ function processSSELine(line, res, state, toolIdMap, requestModel) {
     }
   }
 
+  // ── Reasoning Content Delta (e.g. DeepSeek R1) ──
+  if (delta.reasoning_content) {
+    if (state.currentBlockType !== 'thinking') {
+      closeCurrentBlock(res, state);
+      state.currentBlockIndex++;
+      state.currentBlockType = 'thinking';
+      sendEvent(res, 'content_block_start', {
+        type: 'content_block_start',
+        index: state.currentBlockIndex,
+        content_block: { type: 'thinking', thinking: '' },
+      });
+    }
+    sendEvent(res, 'content_block_delta', {
+      type: 'content_block_delta',
+      index: state.currentBlockIndex,
+      delta: { type: 'thinking_delta', thinking: delta.reasoning_content },
+    });
+  }
+
   // ── Text Content Delta ──
   if (delta.content !== undefined && delta.content !== null) {
     // Start a text block if we haven't yet (or if we were in a tool block)
@@ -162,7 +201,6 @@ function processSSELine(line, res, state, toolIdMap, requestModel) {
         index: state.currentBlockIndex,
         delta: { type: 'text_delta', text: delta.content },
       });
-      state.textBuffer += delta.content;
     }
   }
 

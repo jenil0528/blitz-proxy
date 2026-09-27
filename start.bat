@@ -11,28 +11,11 @@ if errorlevel 1 (
     exit /b 1
 )
 
-:: Check if .env exists
-if not exist ".env" (
-    if exist ".env.example" (
-        copy .env.example .env >nul
-        echo  [INFO] Created .env — paste your API key and restart!
-        notepad .env
-        pause
-        exit /b 0
-    )
-)
-
-:: Check if setup was done (permanent env vars)
-if "%ANTHROPIC_BASE_URL%"=="" (
-    echo  [WARN] Run setup.bat first for one-time setup!
-    echo         Or set env vars manually:
-    echo         $env:ANTHROPIC_BASE_URL = "http://localhost:4819"
-    echo         $env:ANTHROPIC_API_KEY = "blitz"
-    echo.
-)
-
-echo  Starting BlitzProxy...
+echo  Starting BlitzProxy (foreground)...
 echo  Press Ctrl+C to stop.
 echo.
+echo  Tip: use "blitz start" for background mode, or just "blitz" to
+echo  start the proxy and launch Claude Code in one command.
+echo.
 
-node server.js
+node "%~dp0server.js"

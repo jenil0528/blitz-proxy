@@ -1,15 +1,19 @@
 {
   "name": "blitz-proxy",
-  "version": "1.1.0",
-  "description": "Universal Claude Code proxy — works with any OpenAI-compatible API provider",
+  "version": "2.0.0",
+  "description": "BlitzProxy - local-first multi-provider AI gateway for Claude Code, OpenCode, and OpenAI/Anthropic-compatible clients",
   "main": "server.js",
   "type": "module",
+  "bin": {
+    "blitz": "cli.js"
+  },
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "test": "node test/index.js"
+    "test": "node test/index.js",
+    "lint": "node scripts/lint.js"
   },
-  "keywords": ["claude", "proxy", "openai", "nvidia", "groq", "ollama", "huggingface"],
+  "keywords": ["claude", "proxy", "openai", "anthropic", "nvidia", "groq", "openrouter", "deepseek", "ollama", "gateway", "ai"],
   "author": "Jenil <jenil8736@gmail.com>",
   "license": "MIT",
   "engines": {

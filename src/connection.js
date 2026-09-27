@@ -36,11 +36,18 @@ export async function fetchWithPool(url, options = {}, timeouts = {}) {
   const connectTimer = setTimeout(() => {
     controller.abort(new Error(`Connection timeout after ${connectTimeout}ms`));
   }, connectTimeout);
+  connectTimer.unref?.();
 
   // Read timeout — overall deadline for the full response
   const readTimer = setTimeout(() => {
     controller.abort(new Error(`Read timeout after ${readTimeout}ms`));
   }, readTimeout);
+  readTimer.unref?.();
+
+  const clearTimers = () => {
+    clearTimeout(connectTimer);
+    clearTimeout(readTimer);
+  };
 
   try {
     const response = await fetch(url, {
@@ -52,10 +59,20 @@ export async function fetchWithPool(url, options = {}, timeouts = {}) {
     // Connection established — clear the connect timer
     clearTimeout(connectTimer);
 
+    // The read timer guards body consumption; the caller clears it once the
+    // body has been fully consumed via response.__blitzTimers.clear().
+    try {
+      Object.defineProperty(response, '__blitzTimers', {
+        value: { clear: clearTimers },
+        enumerable: false,
+        writable: false,
+        configurable: true,
+      });
+    } catch { /* non-fatal */ }
+
     return response;
   } catch (err) {
-    clearTimeout(connectTimer);
-    clearTimeout(readTimer);
+    clearTimers();
     throw err;
   }
 }

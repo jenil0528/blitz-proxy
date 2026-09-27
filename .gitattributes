@@ -1,0 +1,11 @@
+# Normalize line endings: LF in the repository, native on checkout.
+* text=auto
+
+# Scripts must stay in their native form on every platform
+*.sh  text eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary assets (none currently — placeholder for future-proofing)
+*.png binary
+*.ico binary

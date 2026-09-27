@@ -1,74 +1,89 @@
 #!/bin/bash
 # ============================================================================
-# BlitzProxy — Mac/Linux Setup Script
-# Author: Jenil <jenil8736@gmail.com>
-# Configures shell environment and creates blitz symlink
+# BlitzProxy — Mac/Linux Setup (safe)
+# Installs a small wrapper script so `blitz` works from anywhere.
+# Does NOT touch your shell rc files and does NOT permanently set
+# ANTHROPIC_*/OPENAI_* variables — use `blitz run claude` instead.
 # ============================================================================
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BLITZ_SH="$SCRIPT_DIR/blitz.sh"
+NODE_BIN="$(command -v node || true)"
 
-# ─── Detect shell config file ────────────────────────────────────────────────
+echo ""
+echo "  BlitzProxy — Setup"
+echo "  =================="
+echo ""
 
-RC_FILE=""
-if [ -n "$SHELL" ] && echo "$SHELL" | grep -q "zsh"; then
-  RC_FILE="$HOME/.zshrc"
-elif [ -f "$HOME/.zshrc" ]; then
-  RC_FILE="$HOME/.zshrc"
-elif [ -f "$HOME/.bashrc" ]; then
-  RC_FILE="$HOME/.bashrc"
+# ── Node.js check ─────────────────────────────────────────────────────────────
+if [ -z "$NODE_BIN" ]; then
+  echo "  [FAIL] Node.js is not installed. Install 18+ from https://nodejs.org"
+  exit 1
+fi
+NODE_MAJOR=$(node -v | sed 's/v\([0-9]*\).*/\1/')
+if [ "$NODE_MAJOR" -lt 18 ]; then
+  echo "  [FAIL] Node.js 18+ required (found $(node -v))"
+  exit 1
+fi
+echo "  [OK] Node.js $(node -v)"
+
+# ── Make entry point executable ─────────────────────────────────────────────
+chmod +x "$SCRIPT_DIR/blitz.sh" 2>/dev/null || true
+echo "  [OK] blitz.sh is executable"
+
+# ── Install wrapper (absolute path — reliable from any directory) ─────────────
+# A symlink would break $0 resolution in blitz.sh; a wrapper is robust.
+TARGET="/usr/local/bin/blitz"
+do_install() {
+  mkdir -p "$(dirname "$TARGET")"
+  cat > "$TARGET" <<WRAPPER
+#!/bin/sh
+exec node "$SCRIPT_DIR/cli.js" "\$@"
+WRAPPER
+  chmod +x "$TARGET"
+}
+
+if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
+  if grep -q "BlitzProxy\|$SCRIPT_DIR/cli.js" "$TARGET" 2>/dev/null || head -1 "$TARGET" | grep -q '^#!/bin/sh' 2>/dev/null; then
+    if [ -w "$TARGET" ]; then do_install; else sudo sh -c "echo ok >/dev/null" && sudo cp /dev/stdin "$TARGET" <<WRAPPER 2>/dev/null || { sudo rm -f "$TARGET" && do_install; }
+#!/bin/sh
+exec node "$SCRIPT_DIR/cli.js" "\$@"
+WRAPPER
+    fi
+    echo "  [OK] Updated existing wrapper: $TARGET"
+  else
+    echo "  [WARN] $TARGET exists and does not look like a BlitzProxy wrapper."
+    echo "         Not overwriting. Use it directly: $SCRIPT_DIR/blitz.sh <command>"
+    TARGET=""
+  fi
 else
-  # Fallback: create .bashrc
-  RC_FILE="$HOME/.bashrc"
+  if [ -w "$(dirname "$TARGET")" ]; then
+    do_install
+  else
+    sudo true 2>/dev/null && sudo tee "$TARGET" >/dev/null <<WRAPPER
+#!/bin/sh
+exec node "$SCRIPT_DIR/cli.js" "\$@"
+WRAPPER
+    sudo chmod +x "$TARGET"
+  fi
+  echo "  [OK] Installed: $TARGET → $SCRIPT_DIR/cli.js"
 fi
 
-echo ""
-echo "⚡ BlitzProxy Setup"
-echo "══════════════════════════════════════════════════"
-echo ""
-echo "  Shell config: $RC_FILE"
-echo "  BlitzProxy:   $SCRIPT_DIR"
-echo ""
-
-# ─── Append environment variables ────────────────────────────────────────────
-
-MARKER="# BlitzProxy configuration"
-if grep -qF "$MARKER" "$RC_FILE" 2>/dev/null; then
-  echo "  ✓ Environment variables already configured"
-else
-  echo "" >> "$RC_FILE"
-  echo "$MARKER" >> "$RC_FILE"
-  echo 'export ANTHROPIC_BASE_URL=http://localhost:4819' >> "$RC_FILE"
-  echo 'export ANTHROPIC_API_KEY=blitz' >> "$RC_FILE"
-  echo "  ✓ Added ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY to $RC_FILE"
+# ── Backup config if present ─────────────────────────────────────────────────
+if [ -f "$SCRIPT_DIR/config.json" ]; then
+  BACKUP="$SCRIPT_DIR/config.json.bak.$(date +%Y-%m-%d-%H%M%S)"
+  cp "$SCRIPT_DIR/config.json" "$BACKUP"
+  chmod 600 "$BACKUP"
+  echo "  [OK] Backed up config.json → $(basename "$BACKUP")"
 fi
 
-# ─── Make blitz.sh executable ────────────────────────────────────────────────
-
-chmod +x "$BLITZ_SH"
-echo "  ✓ Made blitz.sh executable"
-
-# ─── Create symlink at /usr/local/bin/blitz ──────────────────────────────────
-
-if [ -L /usr/local/bin/blitz ] || [ -f /usr/local/bin/blitz ]; then
-  echo "  ⚠ /usr/local/bin/blitz already exists — overwriting"
-  sudo rm -f /usr/local/bin/blitz
-fi
-
-sudo ln -s "$BLITZ_SH" /usr/local/bin/blitz
-echo "  ✓ Created symlink: /usr/local/bin/blitz → $BLITZ_SH"
-
-# ─── Done ────────────────────────────────────────────────────────────────────
-
-RC_BASENAME=$(basename "$RC_FILE")
-echo ""
-echo "══════════════════════════════════════════════════"
-echo "  ✅ Setup complete!"
 echo ""
 echo "  Next steps:"
-echo "    1. Run: source ~/$RC_BASENAME   (or restart your terminal)"
-echo "    2. Run: blitz add YOUR_API_KEY"
-echo "    3. Run: blitz"
+echo "    1. blitz add YOUR_API_KEY     # stored in the OS keychain (macOS Keychain / secret-tool)"
+echo "    2. blitz run claude           # Claude Code through BlitzProxy"
+echo "    3. blitz run codex            # Codex CLI through BlitzProxy"
+echo ""
+echo "  No global environment variables were modified."
+echo "  Uninstall: bash $(dirname "$0")/uninstall.sh"
 echo ""

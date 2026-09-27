@@ -1,25 +1,25 @@
 // ============================================================================
-// BlitzProxy — Configuration Manager
-// Author: Jenil <jenil8736@gmail.com>
-// Handles loading, saving, and runtime config updates
-// Auto-detects provider from API key prefix for zero-config setup
-// Multi-API-key management: add, switch, delete keys on the fly
+// BlitzProxy — Configuration Manager (v2)
+// - config.json is the non-secret store (no API keys since v2)
+// - API keys live in the secure keyring (src/security/keyring.js)
+// - .env is honored as INPUT only — secrets are never written back
+// - v1 plaintext configs are migrated automatically with a backup
 // ============================================================================
 
-import { readFileSync, writeFileSync, existsSync } from 'fs';
-import { randomBytes } from 'crypto';
+import { readFileSync, writeFileSync, existsSync, copyFileSync, statSync, renameSync, chmodSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { getProvider, detectProviderFromKey } from './providers.js';
+import { initKeyring, importLegacyKeys, addKey } from './security/keyring.js';
+import { loadPlugins } from './provider-registry.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const CONFIG_PATH = join(__dirname, '..', 'config.json');
+export const CONFIG_PATH = process.env.BLITZ_CONFIG || join(__dirname, '..', 'config.json');
 const ENV_PATH = join(__dirname, '..', '.env');
-const ENV_EXAMPLE_PATH = join(__dirname, '..', '.env.example');
 
-// ─── Zero-dependency .env loader ─────────────────────────────────────────────
+// ─── Zero-dependency .env loader (input only) ────────────────────────────────
+
 function loadEnvFile(filePath) {
-  if (!existsSync(filePath)) return false;
+  if (!existsSync(filePath)) return;
   try {
     const envContent = readFileSync(filePath, 'utf-8');
     for (const line of envContent.split('\n')) {
@@ -29,380 +29,237 @@ function loadEnvFile(filePath) {
       if (eqIdx === -1) continue;
       const key = trimmed.slice(0, eqIdx).trim();
       let value = trimmed.slice(eqIdx + 1).trim();
-      // Strip surrounding quotes
       if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
         value = value.slice(1, -1);
       }
-      if (!process.env[key]) {
-        process.env[key] = value;
-      }
+      if (!process.env[key]) process.env[key] = value;
     }
-    return true;
-  } catch (e) {
-    console.warn('[Config] Failed to load .env file:', e.message);
-    return false;
-  }
-}
-
-// Load .env (create from example if missing)
-if (!existsSync(ENV_PATH) && existsSync(ENV_EXAMPLE_PATH)) {
-  try {
-    writeFileSync(ENV_PATH, readFileSync(ENV_EXAMPLE_PATH, 'utf-8'));
-    console.log('[Config] Created .env from .env.example — paste your API key and restart!');
-  } catch { /* ignore */ }
+  } catch { /* .env is optional input */ }
 }
 loadEnvFile(ENV_PATH);
 
-const DEFAULT_CONFIG = {
-  provider: '',       // Empty = auto-detect from API key
-  apiKey: '',
-  model: '',          // Empty = use provider default
+// ─── Defaults ────────────────────────────────────────────────────────────────
+
+export const DEFAULT_CONFIG = {
+  version: 2,
+  provider: '',
+  model: '',
+  routing: 'manual',            // 'manual' | 'auto'
+  profile: '',                  // '' | coding | fast | free | local | <custom>
+  profiles: {},                 // user-defined profiles
+  fallbackChain: [],             // provider ids tried after the active provider
+  fallbackModels: {},           // { providerId: modelId } per-fallback model
+  fallbackOnAuthError: false,   // auth failures do NOT failover by default
+  proxyPort: 4819,
+  host: '127.0.0.1',            // local-first; never 0.0.0.0 by default
+  requireAuth: false,           // token required for /v1/* (admin always requires it)
   customBaseUrl: '',
   customHeaders: {},
-  proxyPort: 4819,
+  customProviders: {},          // user-defined provider definitions
   maxRetries: 3,
   retryBaseDelay: 500,
   logRequests: true,
   logLevel: 'info',
+  privacy: false,
+  healthTtlMs: 60000,
   timeout: 120000,
-  autoDetected: false, // Flag to indicate provider was auto-detected
-  savedKeys: [],       // Array of { id, name, key, provider, createdAt }
-  activeKeyId: '',     // ID of currently active key
 };
 
 let currentConfig = { ...DEFAULT_CONFIG };
+let configMtime = 0;
+let lastStatCheck = 0;
 
-/**
- * Load config from file + env overrides + auto-detection
- */
+// ─── Load / reload ───────────────────────────────────────────────────────────
+
+function applyEnvOverrides(cfg) {
+  if (process.env.PROVIDER) cfg.provider = process.env.PROVIDER.toLowerCase();
+  if (process.env.MODEL) cfg.model = process.env.MODEL;
+  if (process.env.PROXY_PORT) cfg.proxyPort = parseInt(process.env.PROXY_PORT, 10);
+  if (process.env.CUSTOM_BASE_URL) cfg.customBaseUrl = process.env.CUSTOM_BASE_URL;
+  if (process.env.LOG_LEVEL) cfg.logLevel = process.env.LOG_LEVEL;
+  if (process.env.TIMEOUT) {
+    cfg.timeout = parseInt(process.env.TIMEOUT, 10);
+    cfg._timeoutSet = true;
+  }
+  if (process.env.BLITZ_HOST || process.env.HOST) cfg.host = process.env.BLITZ_HOST || process.env.HOST;
+  if (process.env.PRIVACY) cfg.privacy = String(process.env.PRIVACY) === 'true' || process.env.PRIVACY === '1';
+  return cfg;
+}
+
 export function loadConfig() {
-  // Load from config.json
   if (existsSync(CONFIG_PATH)) {
     try {
       const fileConfig = JSON.parse(readFileSync(CONFIG_PATH, 'utf-8'));
       currentConfig = { ...DEFAULT_CONFIG, ...fileConfig };
+      try { configMtime = statSync(CONFIG_PATH).mtimeMs; } catch { /* ignore */ }
     } catch (e) {
-      console.warn('[Config] Failed to parse config.json, using defaults');
+      console.warn('[Config] Failed to parse config.json, using defaults:', e.message);
       currentConfig = { ...DEFAULT_CONFIG };
     }
   }
+  applyEnvOverrides(currentConfig);
 
-  // Env overrides (highest priority)
-  if (process.env.PROVIDER) currentConfig.provider = process.env.PROVIDER.toLowerCase();
-  if (process.env.API_KEY) currentConfig.apiKey = process.env.API_KEY;
-  if (process.env.MODEL) currentConfig.model = process.env.MODEL;
-  if (process.env.PROXY_PORT) currentConfig.proxyPort = parseInt(process.env.PROXY_PORT, 10);
-  if (process.env.DASHBOARD_PORT) currentConfig.dashboardPort = parseInt(process.env.DASHBOARD_PORT, 10);
-  if (process.env.CUSTOM_BASE_URL) currentConfig.customBaseUrl = process.env.CUSTOM_BASE_URL;
-  if (process.env.LOG_LEVEL) currentConfig.logLevel = process.env.LOG_LEVEL;
-  if (process.env.TIMEOUT) currentConfig.timeout = parseInt(process.env.TIMEOUT, 10);
-
-  // ─── Auto-detect provider from API key ───────────────────────────────
-  if (currentConfig.apiKey && !currentConfig.provider) {
-    const detected = detectProviderFromKey(currentConfig.apiKey);
-    if (detected) {
-      if (detected.confidence === 'ambiguous') {
-        // Ambiguous prefix on startup — default to first candidate
-        const fallback = detected.candidates[0];
-        currentConfig.provider = fallback.provider;
-        currentConfig.autoDetected = true;
-        console.warn(`[Config] ⚠ Ambiguous key prefix "sk-" — defaulting to ${fallback.name}. Run: blitz provider <name> to change.`);
-      } else {
-        currentConfig.provider = detected.provider;
-        currentConfig.autoDetected = true;
-        console.log(`[Config] ✨ Auto-detected provider: ${detected.name} (from key prefix)`);
-      }
-    } else {
-      // Unknown key format — default to custom
-      console.warn('[Config] ⚠ Unknown API key format. Set PROVIDER in .env or use the dashboard.');
-      currentConfig.provider = 'custom';
-    }
+  if (!currentConfig.provider && !currentConfig.model) {
+    // No key anywhere → local default (matches v1 behavior)
   }
-
-  // Fallback: no key and no provider = ollama
-  if (!currentConfig.provider) {
-    currentConfig.provider = 'ollama';
-    currentConfig.autoDetected = true;
-    console.log('[Config] No API key found — defaulting to Ollama (local)');
-  }
-
-  // Set default model if not specified
   if (!currentConfig.model) {
-    const provider = getProvider(currentConfig.provider);
-    currentConfig.model = provider.defaultModel;
+    currentConfig.model = '';
   }
-
-  // Auto-set timeout from provider (unless user explicitly overrode it)
-  if (!process.env.TIMEOUT && !currentConfig._timeoutOverride) {
-    const provider = getProvider(currentConfig.provider);
-    if (provider.timeout) {
-      currentConfig.timeout = provider.timeout;
-    }
-  }
-
   return currentConfig;
 }
 
 /**
- * Save current config to file (also updates .env for persistence)
+ * Pick up config.json changes made by the CLI (throttled mtime check).
  */
-export function saveConfig(updates = {}) {
-  // If API key changed and no explicit provider, re-detect
-  if (updates.apiKey && !updates.provider) {
-    const detected = detectProviderFromKey(updates.apiKey);
-    if (detected) {
-      if (detected.confidence === 'ambiguous') {
-        // Ambiguous — default to first candidate in batch/config mode
-        updates.provider = detected.candidates[0].provider;
-        updates.autoDetected = true;
-      } else {
-        updates.provider = detected.provider;
-        updates.autoDetected = true;
+export function refreshConfigIfChanged() {
+  const now = Date.now();
+  if (now - lastStatCheck < 5000) return currentConfig;
+  lastStatCheck = now;
+  try {
+    if (!existsSync(CONFIG_PATH)) return currentConfig;
+    const mtime = statSync(CONFIG_PATH).mtimeMs;
+    if (mtime !== configMtime) {
+      const savedPrivacy = currentConfig.privacy;
+      const fileConfig = JSON.parse(readFileSync(CONFIG_PATH, 'utf-8'));
+      currentConfig = { ...DEFAULT_CONFIG, ...fileConfig };
+      applyEnvOverrides(currentConfig);
+      configMtime = mtime;
+      if (savedPrivacy !== currentConfig.privacy) {
+        console.log(`[Config] privacy mode ${currentConfig.privacy ? 'enabled' : 'disabled'}`);
       }
     }
-  }
-
-  currentConfig = { ...currentConfig, ...updates };
-
-  // Save config.json
-  try {
-    writeFileSync(CONFIG_PATH, JSON.stringify(currentConfig, null, 2), 'utf-8');
-  } catch (e) {
-    console.error('[Config] Failed to save config.json:', e.message);
-  }
-
-  // Also update .env for easy portability
-  try {
-    const envLines = [
-      '# BlitzProxy — Configuration',
-      '# Just paste your API key below — provider is auto-detected!',
-      '',
-      `API_KEY=${currentConfig.apiKey || ''}`,
-      `PROVIDER=${currentConfig.autoDetected ? '' : currentConfig.provider}`,
-      `MODEL=${currentConfig.model || ''}`,
-      `PROXY_PORT=${currentConfig.proxyPort}`,
-    ];
-    // Only write DASHBOARD_PORT if it's a valid number (avoid persisting NaN / undefined)
-    if (typeof currentConfig.dashboardPort === 'number' && !isNaN(currentConfig.dashboardPort)) {
-      envLines.push(`DASHBOARD_PORT=${currentConfig.dashboardPort}`);
-    }
-    writeFileSync(ENV_PATH, envLines.join('\n') + '\n', 'utf-8');
-  } catch { /* .env write is best-effort */ }
-
+  } catch { /* keep the in-memory config on read errors */ }
   return currentConfig;
 }
 
-/**
- * Get current config (read-only copy)
- */
 export function getConfig() {
   return { ...currentConfig };
 }
 
+export function getConfigRaw() {
+  return currentConfig;
+}
+
+// ─── Save ─────────────────────────────────────────────────────────────────────
+
+const SECRET_FIELDS = ['apiKey', 'savedKeys', 'autoDetected', '_timeoutSet'];
+
 /**
- * Get the effective base URL for the current provider
+ * Save config updates to config.json.
+ * Secret fields are never persisted — keys live in the keyring only.
  */
-export function getEffectiveBaseUrl() {
-  if (currentConfig.provider === 'custom' && currentConfig.customBaseUrl) {
-    return currentConfig.customBaseUrl.replace(/\/+$/, '');
+export function saveConfig(updates = {}) {
+  const merged = { ...currentConfig, ...updates };
+  const persisted = {};
+  for (const [k, v] of Object.entries(merged)) {
+    if (SECRET_FIELDS.includes(k)) continue;
+    if (k.startsWith('_')) continue;
+    persisted[k] = v;
   }
-  const provider = getProvider(currentConfig.provider);
-  return provider.baseUrl;
-}
+  currentConfig = merged;
 
-/**
- * Get the effective headers for the current provider
- */
-export function getEffectiveHeaders() {
-  const provider = getProvider(currentConfig.provider);
-  const headers = {
-    'Content-Type': 'application/json',
-    ...provider.headers,
-    ...currentConfig.customHeaders,
-  };
-
-  // Add auth header (skip for Ollama or if no key)
-  if (currentConfig.apiKey && currentConfig.provider !== 'ollama') {
-    headers['Authorization'] = `Bearer ${currentConfig.apiKey}`;
-  }
-
-  return headers;
-}
-
-/**
- * Get the effective model name
- */
-export function getEffectiveModel() {
-  return currentConfig.model || getProvider(currentConfig.provider).defaultModel || 'gpt-3.5-turbo';
-}
-
-// ─── Multi-API Key Management ────────────────────────────────────────────────
-
-function generateKeyId() {
-  return randomBytes(8).toString('hex');
-}
-
-/**
- * Get all saved API keys (with keys masked for security)
- */
-export function getApiKeys(includeFull = false) {
-  return (currentConfig.savedKeys || []).map(k => ({
-    id: k.id,
-    name: k.name,
-    provider: k.provider,
-    providerName: k.providerName || getProvider(k.provider).name,
-    key: includeFull ? k.key : maskKey(k.key),
-    isActive: k.id === currentConfig.activeKeyId,
-    createdAt: k.createdAt,
-  }));
-}
-
-/**
- * Add a new API key to the saved list
- * Returns the new key entry (masked)
- */
-export function addApiKey({ name, key, provider, model }) {
-  if (!key) throw new Error('API key is required');
-
-  // Auto-detect provider from key if not specified
-  let resolvedProvider = provider;
-  let providerName = '';
-  if (!resolvedProvider) {
-    const detected = detectProviderFromKey(key);
-    if (detected) {
-      // Ambiguous prefix (e.g. sk-) — caller must resolve before saving
-      if (detected.confidence === 'ambiguous') {
-        const err = new Error('AMBIGUOUS_PROVIDER');
-        err.code = 'AMBIGUOUS_PROVIDER';
-        err.candidates = detected.candidates;
-        throw err;
-      }
-      resolvedProvider = detected.provider;
-      providerName = detected.name;
-    } else {
-      resolvedProvider = 'custom';
-      providerName = 'Custom';
-    }
-  } else {
-    providerName = getProvider(resolvedProvider).name;
-  }
-
-  const entry = {
-    id: generateKeyId(),
-    name: name || providerName,
-    key,
-    provider: resolvedProvider,
-    providerName,
-    model: model || '',
-    createdAt: new Date().toISOString(),
-  };
-
-  if (!currentConfig.savedKeys) currentConfig.savedKeys = [];
-  currentConfig.savedKeys.push(entry);
-
-  // If no active key, auto-activate this one
-  if (!currentConfig.activeKeyId) {
-    setActiveKey(entry.id);
-  } else {
-    persistConfig();
-  }
-
-  return {
-    ...entry,
-    key: maskKey(entry.key),
-    isActive: entry.id === currentConfig.activeKeyId,
-  };
-}
-
-/**
- * Remove an API key by ID
- */
-export function removeApiKey(keyId) {
-  if (!currentConfig.savedKeys) return false;
-
-  const idx = currentConfig.savedKeys.findIndex(k => k.id === keyId);
-  if (idx === -1) return false;
-
-  currentConfig.savedKeys.splice(idx, 1);
-
-  // If we deleted the active key, switch to first available or clear
-  if (currentConfig.activeKeyId === keyId) {
-    if (currentConfig.savedKeys.length > 0) {
-      setActiveKey(currentConfig.savedKeys[0].id);
-    } else {
-      currentConfig.activeKeyId = '';
-      currentConfig.apiKey = '';
-      currentConfig.provider = 'ollama';
-      currentConfig.autoDetected = true;
-      persistConfig();
-    }
-  } else {
-    persistConfig();
-  }
-
-  return true;
-}
-
-/**
- * Set a key as the active one — updates apiKey + provider in config
- */
-export function setActiveKey(keyId) {
-  if (!currentConfig.savedKeys) return false;
-
-  const entry = currentConfig.savedKeys.find(k => k.id === keyId);
-  if (!entry) return false;
-
-  currentConfig.activeKeyId = keyId;
-  currentConfig.apiKey = entry.key;
-  currentConfig.provider = entry.provider;
-  currentConfig.autoDetected = false;
-
-  // Also set model if the key has a preferred model
-  if (entry.model) {
-    currentConfig.model = entry.model;
-  }
-
-  // Auto-set timeout from provider
-  const providerDef = getProvider(entry.provider);
-  if (providerDef.timeout) {
-    currentConfig.timeout = providerDef.timeout;
-  }
-
-  persistConfig();
-  return true;
-}
-
-/**
- * Update an existing key's name
- */
-export function updateApiKey(keyId, updates) {
-  if (!currentConfig.savedKeys) return null;
-
-  const entry = currentConfig.savedKeys.find(k => k.id === keyId);
-  if (!entry) return null;
-
-  if (updates.name !== undefined) entry.name = updates.name;
-
-  persistConfig();
-  return {
-    ...entry,
-    key: maskKey(entry.key),
-    isActive: entry.id === currentConfig.activeKeyId,
-  };
-}
-
-function maskKey(key) {
-  if (!key || key.length < 8) return '••••••••';
-  return key.slice(0, 6) + '••••' + key.slice(-4);
-}
-
-/**
- * Internal: persist current config to disk
- */
-function persistConfig() {
   try {
-    writeFileSync(CONFIG_PATH, JSON.stringify(currentConfig, null, 2), 'utf-8');
+    const tmp = CONFIG_PATH + '.tmp';
+    writeFileSync(tmp, JSON.stringify(persisted, null, 2), 'utf-8');
+    try { chmodSync(tmp, 0o600); } catch { /* Windows: ACLs apply */ }
+    renameSync(tmp, CONFIG_PATH);
+    configMtime = statSync(CONFIG_PATH).mtimeMs;
   } catch (e) {
     console.error('[Config] Failed to save config.json:', e.message);
   }
+  return currentConfig;
 }
+
+// ─── Migration (v1 plaintext → v2 secure) ─────────────────────────────────────
+
+/**
+ * One-shot migration of v1 configs:
+ *   - savedKeys + apiKey move into the secure keyring
+ *   - original config.json backed up with restrictive permissions
+ *   - .env keeps working as input, but is no longer written by BlitzProxy
+ * Returns { migrated, backupPath }.
+ */
+async function migrateV1IfNeeded() {
+  const legacyKeys = currentConfig.savedKeys;
+  const legacyActive = currentConfig.activeKeyId;
+  const legacyApiKey = currentConfig.apiKey;
+
+  let migrated = 0;
+  let backupPath = null;
+
+  if (Array.isArray(legacyKeys) && legacyKeys.length > 0) {
+    migrated = await importLegacyKeys(legacyKeys, legacyActive);
+    try {
+      backupPath = CONFIG_PATH + '.bak.' + new Date().toISOString().replace(/[:.]/g, '-');
+      copyFileSync(CONFIG_PATH, backupPath);
+      try { chmodSync(backupPath, 0o600); } catch { /* best effort */ }
+    } catch { /* backup is best-effort */ }
+    console.log(`[Config] ✅ Migrated ${migrated} API key(s) to secure storage.`);
+    if (backupPath) console.log(`[Config] Plaintext backup (keep private or delete): ${backupPath}`);
+  } else if (typeof legacyApiKey === 'string' && legacyApiKey && !legacyKeys) {
+    // Single-key v1 setup without savedKeys
+    try {
+      await addKey({ key: legacyApiKey, provider: currentConfig.provider || undefined });
+      migrated = 1;
+      console.log('[Config] ✅ Migrated API key from config to secure storage.');
+    } catch { /* ambiguous or invalid — leave it in env */ }
+  }
+
+  if (migrated > 0 || currentConfig.savedKeys !== undefined || currentConfig.apiKey !== undefined) {
+    // Strip secret fields from config.json
+    const updates = {};
+    for (const k of SECRET_FIELDS) {
+      if (k in currentConfig && k !== '_timeoutSet') updates[k] = undefined;
+    }
+    if ('activeKeyId' in currentConfig) updates.activeKeyId = undefined;
+    updates.version = 2;
+    const merged = { ...currentConfig };
+    for (const k of Object.keys(updates)) delete merged[k];
+    merged.version = 2;
+    const persisted = {};
+    for (const [k, v] of Object.entries(merged)) {
+      if (k.startsWith('_')) continue;
+      persisted[k] = v;
+    }
+    currentConfig = merged;
+    try {
+      writeFileSync(CONFIG_PATH, JSON.stringify(persisted, null, 2), 'utf-8');
+      configMtime = statSync(CONFIG_PATH).mtimeMs;
+    } catch (e) {
+      console.error('[Config] Failed to rewrite config.json:', e.message);
+    }
+  }
+
+  // First run with no vault at all: adopt API_KEY from environment/.env input
+  const { keyCount } = await import('./security/keyring.js');
+  if ((await keyCount()) === 0 && process.env.API_KEY) {
+    try {
+      await addKey({ key: process.env.API_KEY });
+      console.log('[Config] ✅ Imported API key from .env/environment into secure storage.');
+    } catch (err) {
+      if (err.code !== 'AMBIGUOUS_PROVIDER') {
+        console.warn('[Config] Could not import API_KEY from environment:', err.message);
+      }
+    }
+  }
+
+  return { migrated, backupPath };
+}
+
+// ─── App initialization ──────────────────────────────────────────────────────
+
+/**
+ * Full initialization: config load → plugins → keyring → v1 migration.
+ * Used by the server and the CLI.
+ */
+export async function initApp() {
+  loadConfig();
+  const projectDir = join(__dirname, '..');
+  const home = process.env.BLITZ_HOME || null;
+  const plugins = await loadPlugins(projectDir, home);
+  const mode = await initKeyring();
+  const migration = await migrateV1IfNeeded();
+  return { config: getConfig(), keyringMode: mode, plugins, migration };
+}
+
+export { initKeyring };

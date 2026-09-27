@@ -11,11 +11,13 @@ permissions:
 
 jobs:
   test:
-    name: Node.js ${{ matrix.node-version }}
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }} — Node.js ${{ matrix.node-version }}
+    runs-on: ${{ matrix.os }}
 
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
         node-version: ["18", "20", "22"]
 
     steps:
@@ -26,5 +28,10 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
 
+      - name: Syntax lint
+        run: npm run lint
+
       - name: Run tests
         run: npm test
+        env:
+          BLITZ_KEYRING: memory
