@@ -15,6 +15,7 @@ import { resolveActiveProvider } from './src/routing/router.js';
 import { createProxyServer } from './src/server.js';
 import { createStats } from './src/stats.js';
 import { getProxyToken } from './src/security/auth.js';
+import { assertSafeBind } from './src/security/lan.js';
 import * as log from './src/logger.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -29,6 +30,10 @@ async function main() {
 
   const cfg = getConfig();
   log.setLogLevel(cfg.logLevel);
+
+  // Security guard: a non-loopback bind without authentication refuses to
+  // start. Local-only behavior is never touched.
+  assertSafeBind(cfg);
 
   const home = process.env.BLITZ_HOME || join(homedir(), '.blitzproxy');
   const stats = createStats({ home, privacy: cfg.privacy === true });

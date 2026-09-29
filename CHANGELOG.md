@@ -1,6 +1,36 @@
 # Changelog
 
-## Unreleased
+## Unreleased — BLITZ gateway evolution
+
+### Added — Canonical credential resolution & smart rotation
+- **`src/credentials.js`** — ONE resolver for every subsystem (requests, health, validation, discovery, CLI). Direct `keys[0]` indexing is eliminated across server, router, and CLI.
+- **Smart rotation, not round-robin**: live 401/403 marks a credential invalid (5-min hold), 429 applies a 60s cooldown, success clears state. Selection order: vault-active → healthiest (fewest failures) → cooling → held-out as last resort. Candidates now carry `credentialId`, so a rejected key never poisons its provider and the *next* request starts with the healthy credential.
+- Per-credential stats (`successes`, `failures`, `lastUsed`, state) — never key material.
+
+### Added — Model registry, discovery & aliases
+- `blitz models` / `models search` / `models info` — full registry view across usable providers (catalog + discovered), ACTIVE marker, honest capability display (never fabricated).
+- `blitz models refresh [provider]` — discovery from the provider's `/models` endpoint, cached in config (`discoveredModels`); failed discovery never deletes manual entries; the proxy never calls `/models` per request.
+- `GET /v1/models` now serves catalog + discovered models for the active provider.
+- `blitz use <provider>/<model>` — switches ONLY the model; credentials untouched. `blitz alias set/list/remove` — short names (`coding → nvidia/z-ai/glm-5.3`) resolved centrally; `blitz use <alias>`.
+
+### Added — Configuration validation & LAN safety
+- `blitz config validate` — read-only validation of syntax, providers, credentials, models, profiles, fallback chains (incl. circular), routing, ports, timeouts, and LAN safety; actionable errors/warnings; exit 0/1; never mutates, never prints secrets. Reusable `validateConfig()` + `formatValidation()`.
+- **LAN bind guard** (`src/security/lan.js`): non-loopback `host` without `requireAuth` makes the server refuse to start with a clear fix-it message. Loopback behavior unchanged.
+
+### Added — Observability & launchers
+- **Request correlation**: every response carries `X-Blitz-Request-Id` (`BLZ-XXXXXX`); error payloads include `request_id`; request logs carry `req=`.
+- Agent launchers: `blitz claude` / `opencode` / `codex` / `aider` (shortcuts for `blitz run <agent>`). Cline/Roo Code connect via base-URL settings (documented — they are editor extensions, not CLIs).
+- Enhanced `blitz status`: gateway state, active route (provider/model/credential), registry counts (providers, credentials, models), endpoint availability.
+- Timeout hierarchy: global (explicit) → model (catalog `timeout` field) → provider → 120s default.
+
+### Added — Opt-in live test mode
+- `BLITZ_LIVE_TESTS=1 npm run test:live` — real-provider end-to-end checks (config validation, credential validation, /health, /v1/models, Anthropic non-stream/stream/tools, OpenAI chat, Responses) with strict timeouts, never printing keys. Never runs in CI.
+
+### Repository
+- Stale `jenil0528/claude-code-proxy` references updated to `jenil0528/blitz-proxy` (README badge, CONTRIBUTING).
+- Tests: **231 tests across 16 suites** — new suites for credential resolution/smart rotation, config validation + LAN guard, model discovery cache + aliases; server suite extended (rotation ordering across requests, request IDs, /v1/models with discovered models).
+
+## Unreleased (previous)
 
 ### Added — Multi-key management & rotation
 - **Multiple API keys per provider** — `blitz add` no longer replaces the existing key for a provider; extra keys are kept (with auto-suffixed names like `NVIDIA NIM #2`) and shown with rotation counts in `blitz keys`.

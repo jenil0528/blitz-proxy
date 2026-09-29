@@ -45,19 +45,24 @@ other clients ──────▶  ┌────────────┐ 
 
 | Path | Responsibility |
 |---|---|
-| `server.js` | Launcher: init app, token, stats, listen, PID file, graceful shutdown |
-| `cli.js` | All terminal commands (async main, dispatch table) |
-| `src/server.js` | `createProxyServer()` — endpoints, auth, candidate loop, admin API, dashboard |
+| `server.js` | Launcher: init app, token, stats, **LAN bind guard**, listen, PID file, graceful shutdown |
+| `cli.js` | All terminal commands (async main, dispatch table, agent launchers) |
+| `src/server.js` | `createProxyServer()` — endpoints, auth, candidate loop, admin API, dashboard, request IDs |
 | `src/config.js` | Config v2: load/save/migrate, env input, hot reload (`refreshConfigIfChanged`) |
+| `src/config-validate.js` | Read-only configuration validation (providers, credentials, models, profiles, fallbacks, ports, timeouts, LAN safety) |
+| `src/credentials.js` | **Canonical credential resolver** — one selection path for every subsystem; live credential states (invalid hold, rate-limit cooldown, successes/failures), healthiest-first rotation order |
 | `src/providers.js` | Static catalog: base URLs, models, capabilities, pricing estimates, key prefixes |
 | `src/provider-registry.js` | Adapter interface (chat/validateKey/healthCheck/listModels), plugin loading |
-| `src/routing/router.js` | `planCandidates()` — chain resolution, key/model resolution, capability filtering |
+| `src/routing/router.js` | `planCandidates()` — chain resolution, per-credential candidates, model/provider/global timeout hierarchy, capability filtering |
 | `src/routing/fallback.js` | Error classification: kind + `fallbackable` + `retryable` |
-| `src/routing/health.js` | TTL-cached health monitor (never probes inline in requests) |
+| `src/routing/health.js` | TTL-cached health monitor + passive marks from real traffic (never probes inline in requests) |
 | `src/routing/capabilities.js` | Token estimation, request needs, model satisfaction |
 | `src/routing/profiles.js` | Built-in + user profiles, chain parsing, local-only enforcement |
+| `src/models-cache.js` | Model discovery cache — merge/dedupe/preserve, never fabricates capabilities |
+| `src/aliases.js` | Model aliases (`coding → nvidia/z-ai/glm-5.3`), single deterministic lookup |
 | `src/security/keyring.js` | Platform vault: DPAPI/Keychain/Secret Service/file/memory |
 | `src/security/auth.js` | Proxy token generation, constant-time checks, extraction |
+| `src/security/lan.js` | Loopback detection + `assertSafeBind` — non-loopback without auth refuses to start |
 | `src/security/mask.js` | `maskKey`, `maskKeyWithPrefix`, `redactSecrets` |
 | `src/translator.js` | Anthropic → OpenAI request / OpenAI → Anthropic response |
 | `src/stream-translator.js` | OpenAI SSE → Anthropic SSE (blocks, thinking, error events) |
@@ -69,18 +74,26 @@ other clients ──────▶  ┌────────────┐ 
 
 ## Request Lifecycle (Anthropic endpoint)
 
-1. `POST /v1/messages` → body read (10 MB cap) → JSON parse → 400 on invalid.
+1. `POST /v1/messages` → body read (10 MB cap) → JSON parse → 400 on invalid. A `requestId` (`BLZ-XXXXXX`) is generated per request and attached to logs, headers (`X-Blitz-Request-Id`), and error payloads.
 2. `requestNeeds()` + `estimateTokens()` → `planCandidates()` builds an ordered chain:
    - **profile active?** → profile chain (local-only profiles filtered to local providers)
    - **routing=auto?** → health-snapshot + capability + priority ranking
    - **else** → active provider, then `fallbackChain`
-   - Providers without keys skipped; capability mismatches skipped **only if an alternative exists**.
-3. For each candidate: `translateRequest()` → `withRetry(adapter.chat())` (backoff on 429/5xx, same-provider retries).
+   - Providers without credentials skipped; capability mismatches skipped **only if an alternative exists**; **one candidate per credential** in resolver order (active → healthiest → cooling → held-out).
+3. For each candidate: `translateRequest()` → `withRetry(adapter.chat())` (backoff on 429/5xx, same-provider retries). Timeout: global (if explicitly set) → model → provider → 120s default.
 4. Non-OK → `classifyHttpError()`:
+   - **auth (401/403)** and another credential exists for the SAME provider → mark that credential invalid (5-min hold) and rotate — not a failover, so `fallbackOnAuthError` does not gate it, and no provider health is poisoned on a successful rotation.
+   - **rate limit (429)** → that credential cools down (60s); retry then failover may proceed per policy.
    - fallbackable (rate-limit / server / timeout / context-overflow / model-not-found) and more candidates remain → log `FALLBACK a→b`, next candidate.
-   - otherwise → mapped Anthropic error (401/429/400/529/502) and stop. Auth and invalid-request errors never failover (config opt-in for auth).
-5. OK → **streaming**: SSE headers out, `translateStream()` pipes events; from this moment no provider switching is possible by design. A mid-stream failure emits an `error` SSE event. **Non-streaming**: `translateResponse()` → 200.
+   - otherwise → mapped Anthropic error (401/429/400/529/502) with the request id and stop. Invalid-request errors never fail over.
+5. OK → the credential's state is cleared and a success recorded. **Streaming**: SSE headers out, `translateStream()` pipes events; from this moment no provider switching is possible by design. A mid-stream failure emits an `error` SSE event. **Non-streaming**: `translateResponse()` → 200.
 6. Stats recorded per attempt (tokens, latency, rate-limit flag, fallback attribution); `blitz.log` gets one metadata line (skipped in privacy mode).
+
+## Credential Resolution (canonical)
+
+Every subsystem — requests, health checks, `blitz validate`, `blitz health`, model discovery, CLI status — resolves credentials through `src/credentials.js`. Nothing may index `keys[0]` directly.
+
+Priority: explicit credential id → vault-active credential → healthiest eligible (fewest recent failures, then vault order) → rate-limit-cooled → invalid-held as last resort (keys can recover upstream, so they are never permanently excluded). States are in-process per credential id; `credentialStats()` exposes them without key material for status/doctor.
 
 ## Configuration Flow
 

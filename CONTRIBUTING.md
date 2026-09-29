@@ -13,9 +13,9 @@ Thanks for improving BlitzProxy!
 ## Development Setup
 
 ```bash
-git clone https://github.com/jenil0528/claude-code-proxy
-cd claude-code-proxy
-npm test          # 145 tests across 11 suites
+git clone https://github.com/jenil0528/blitz-proxy
+cd blitz-proxy
+npm test          # 184+ tests across 13 suites
 npm run lint      # syntax check
 ```
 

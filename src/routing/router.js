@@ -12,11 +12,13 @@ import { PROVIDERS, PROVIDER_PRIORITY, getProvider, bestModelFor, findModelInfo 
 import { resolveProvider, allProviderIds } from '../provider-registry.js';
 import { modelSatisfies, contextHeadroom } from './capabilities.js';
 import { resolveProfileChain } from './profiles.js';
+import { resolveCredential, resolveCredentials } from '../credentials.js';
 
 /**
  * Resolve the active provider + key.
  * Precedence: env API_KEY (power-user input) → cfg.provider (explicit user
  * choice, single source of truth) → vault active key (blitz add/switch) → ollama.
+ * Credential selection always goes through the canonical resolver.
  */
 export async function resolveActiveProvider(cfg, keyring) {
   const envKey = process.env.API_KEY;
@@ -30,25 +32,24 @@ export async function resolveActiveProvider(cfg, keyring) {
     }
     const def = resolveProvider(providerId, cfg) || getProvider('custom');
     const model = (cfg.model && providerOwnsModel(providerId, cfg.model, cfg)) ? cfg.model : def.defaultModel;
-    return { providerId, def, key: envKey, model, source: 'env' };
+    return { providerId, def, key: envKey, credentialId: null, model, source: 'env' };
   }
 
-  // Explicit provider selection (`blitz provider X`) wins — the key for that
-  // provider is looked up in the vault. Never silently substitute another
-  // provider's key.
+  // Explicit provider selection (`blitz provider X`) wins — the credential
+  // for that provider is resolved canonically. Never silently substitute
+  // another provider's key.
   const wanted = cfg.provider || '';
   if (wanted) {
     const def = resolveProvider(wanted, cfg) || getProvider('custom');
     let key = '';
+    let credentialId = null;
     if (def.requiresKey !== false) {
-      const entries = await keyring.keysForProvider(wanted);
-      if (entries.length > 0) {
-        const full = await keyring.getKeyById(entries[0].id);
-        key = full?.key || '';
-      }
+      const cred = await resolveCredential({ keyring, providerId: wanted });
+      key = cred?.key || '';
+      credentialId = cred?.id || null;
     }
     const model = (cfg.model && providerOwnsModel(wanted, cfg.model, cfg)) ? cfg.model : (def.defaultModel || '');
-    return { providerId: wanted, def, key, model, source: 'config' };
+    return { providerId: wanted, def, key, credentialId, model, source: 'config' };
   }
 
   // No explicit provider → the vault's active key decides (blitz add / switch flow)
@@ -56,13 +57,13 @@ export async function resolveActiveProvider(cfg, keyring) {
   if (entry) {
     const def = resolveProvider(entry.provider, cfg) || getProvider('custom');
     const model = entry.model || ((cfg.model && providerOwnsModel(entry.provider, cfg.model, cfg)) ? cfg.model : def.defaultModel);
-    return { providerId: entry.provider, def, key: entry.key, model, source: 'vault' };
+    return { providerId: entry.provider, def, key: entry.key, credentialId: entry.id, model, source: 'vault' };
   }
 
   // No key at all → no-key providers (ollama / configured custom)
   const providerId = 'ollama';
   const def = PROVIDERS.ollama;
-  return { providerId, def, key: '', model: def.defaultModel, source: 'default' };
+  return { providerId, def, key: '', credentialId: null, model: def.defaultModel, source: 'default' };
 }
 
 function providerOwnsModel(providerId, modelId, cfg) {
@@ -177,30 +178,24 @@ export async function planCandidates({ cfg, keyring, needs, estTokens, health })
 
   // Resolve each candidate: key + model + capability check.
   // A provider with several stored keys yields one candidate per key, so the
-  // request loop can rotate to the next key when one is rejected (401/403).
+  // request loop can rotate to the next credential when one is rejected
+  // (401/403). Ordering comes from the canonical credential resolver.
   let candidates = [];
   const skippedForCapability = [];
   for (const c of deduped) {
     const def = resolveProvider(c.provider, cfg);
     if (!def) continue;
 
-    let providerKeys = [''];
+    let providerCreds = [{ key: '', credentialId: null }];
     if (def.requiresKey !== false) {
-      const entries = await keyring.keysForProvider(c.provider);
-      const fullKeys = [];
-      for (const e of entries) {
-        const full = await keyring.getKeyById(e.id);
-        if (full?.key) fullKeys.push(full.key);
-      }
-      // Env-provided key strictly overrides stored keys for the active provider.
       if (c.provider === active.providerId && active.key && active.source === 'env') {
-        providerKeys = [active.key];
-      } else if (c.provider === active.providerId && active.key && fullKeys.includes(active.key)) {
-        providerKeys = [active.key, ...fullKeys.filter(k => k !== active.key)];
+        // Env-provided key strictly overrides stored credentials.
+        providerCreds = [{ key: active.key, credentialId: null }];
       } else {
-        providerKeys = fullKeys;
+        providerCreds = (await resolveCredentials({ keyring, providerId: c.provider }))
+          .map(cred => ({ key: cred.key, credentialId: cred.id }));
       }
-      if (providerKeys.length === 0) continue;
+      if (providerCreds.length === 0) continue;
     }
 
     let model = c.model
@@ -213,17 +208,21 @@ export async function planCandidates({ cfg, keyring, needs, estTokens, health })
 
     const sat = modelSatisfies(c.provider, model, needs || {}, estTokens || 0);
     if (!sat.ok) {
-      skippedForCapability.push({ provider: c.provider, model, reasons: sat.reasons, keys: providerKeys });
+      skippedForCapability.push({ provider: c.provider, model, reasons: sat.reasons, creds: providerCreds });
       continue;
     }
     for (const r of sat.reasons || []) warnings.push(`${c.provider}: ${r}`);
 
-    for (const key of providerKeys) {
+    for (const cred of providerCreds) {
       candidates.push({
         provider: c.provider,
         model,
-        key,
-        timeoutMs: cfg._timeoutSet ? cfg.timeout : (def.timeout || 120000),
+        key: cred.key,
+        credentialId: cred.credentialId,
+        // Timeout hierarchy: global (explicit) → model → provider → default
+        timeoutMs: cfg._timeoutSet
+          ? cfg.timeout
+          : (def.models?.[model]?.timeout || def.timeout || 120000),
         source,
       });
     }
@@ -235,12 +234,13 @@ export async function planCandidates({ cfg, keyring, needs, estTokens, health })
     for (const s of skippedForCapability) {
       const def = resolveProvider(s.provider, cfg);
       warnings.push(`⚠ ${s.provider}/${s.model}: ${s.reasons.join('; ')} — using anyway (no alternative)`);
-      for (const key of s.keys) {
+      for (const cred of s.creds) {
         candidates.push({
           provider: s.provider,
           model: s.model,
-          key,
-          timeoutMs: cfg._timeoutSet ? cfg.timeout : (def?.timeout || 120000),
+          key: cred.key,
+          credentialId: cred.credentialId,
+          timeoutMs: cfg._timeoutSet ? cfg.timeout : (def?.models?.[s.model]?.timeout || def?.timeout || 120000),
           source,
         });
       }

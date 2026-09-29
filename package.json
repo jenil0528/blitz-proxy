@@ -11,6 +11,7 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "test": "node test/index.js",
+    "test:live": "node test/live.js",
     "lint": "node scripts/lint.js"
   },
   "keywords": ["claude", "proxy", "openai", "anthropic", "nvidia", "groq", "openrouter", "deepseek", "ollama", "gateway", "ai"],

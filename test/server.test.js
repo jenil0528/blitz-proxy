@@ -319,6 +319,56 @@ await test('key rotation exhausted: auth error surfaces when every key is reject
   }
 });
 
+await test('smart rotation: after a rejection the NEXT request uses the healthy credential first', async () => {
+  try {
+    saveConfig({ provider: 'mockc', model: 'mock/model-c', fallbackChain: [], profile: '' });
+    // Request 1: rot-key-1 rejected → rotates to rot-key-2 → succeeds
+    const r1 = await post('/v1/messages', anthropicReq());
+    assert.equal(r1.status, 200);
+    // Request 2: must START with the healthy credential (rot-key-2) — no retry of the dead one
+    const before = mockC.requests.length;
+    const r2 = await post('/v1/messages', anthropicReq());
+    assert.equal(r2.status, 200);
+    assert.equal(mockC.requests.length, before + 1, 'second request must need exactly one upstream attempt');
+    assert.equal(mockC.requests[before].headers['authorization'], 'Bearer rot-key-2',
+      'rejected credential is skipped by the resolver on subsequent requests');
+  } finally {
+    saveConfig({ provider: 'mocka', model: 'mock/model-a', fallbackChain: ['mockb'], profile: '' });
+  }
+});
+
+await test('request IDs: every error carries a BLZ- correlation id', async () => {
+  mockA.setMode('401');
+  const res = await post('/v1/messages', anthropicReq());
+  assert.equal(res.status, 401);
+  const data = await res.json();
+  assert.ok(/^BLZ-[A-F0-9]{6}$/.test(data.request_id || ''), 'error payload includes a request id');
+  assert.equal(res.headers.get('x-blitz-request-id'), data.request_id, 'header matches payload');
+});
+
+await test('request IDs: success responses carry the header too', async () => {
+  const res = await post('/v1/messages', anthropicReq());
+  assert.equal(res.status, 200);
+  assert.ok(/^BLZ-[A-F0-9]{6}$/.test(res.headers.get('x-blitz-request-id') || ''));
+  const stream = await post('/v1/messages', anthropicReq({ stream: true }));
+  assert.ok(/^BLZ-[A-F0-9]{6}$/.test(stream.headers.get('x-blitz-request-id') || ''));
+});
+
+await test('GET /v1/models includes discovered models for the active provider', async () => {
+  try {
+    saveConfig({ discoveredModels: { mocka: { models: [{ id: 'mock/discovered-x', lastSeen: 'now' }], fetchedAt: 'now' } } });
+    const res = await fetch(baseUrl + '/v1/models');
+    const data = await res.json();
+    const ids = data.data.map(m => m.id);
+    assert.ok(ids.includes('claude-3-5-sonnet-20241022'), 'Claude-compat entries remain');
+    assert.ok(ids.includes('mock/model-a'), 'catalog entries remain');
+    assert.ok(ids.includes('mock/discovered-x'), 'discovered entry is exposed');
+    assert.equal(ids.filter(i => i === 'mock/discovered-x').length, 1, 'no duplicates');
+  } finally {
+    saveConfig({ discoveredModels: {} });
+  }
+});
+
 await test('NO fallback on invalid request: 400 invalid_request_error', async () => {
   mockA.setMode('invalid');
   const requestsBefore = mockB.requests.length;

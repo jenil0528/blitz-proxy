@@ -23,6 +23,8 @@ import { translateRequest, translateResponse } from './translator.js';
 import { translateStream } from './stream-translator.js';
 import { translateResponsesRequest, translateResponsesResponse, translateResponsesStream } from './responses-translator.js';
 import { withRetry } from './retry.js';
+import { resolveCredential, markCredentialRejected, markCredentialRateLimited, markCredentialHealthy } from './credentials.js';
+import { newDiscoveredIds } from './models-cache.js';
 import { requestNeeds, requestNeedsOpenAI, estimateTokens } from './routing/capabilities.js';
 import { planCandidates, resolveActiveProvider } from './routing/router.js';
 import { classifyHttpError, classifyNetworkError } from './routing/fallback.js';
@@ -104,41 +106,54 @@ function effectiveDef(def, cfg) {
   return def;
 }
 
-function sendJson(res, status, obj) {
+function sendJson(res, status, obj, requestId) {
   if (!res.headersSent) {
-    res.writeHead(status, { 'Content-Type': 'application/json' });
+    res.writeHead(status, {
+      'Content-Type': 'application/json',
+      ...(requestId ? { 'X-Blitz-Request-Id': requestId } : {}),
+    });
   }
   try { res.end(JSON.stringify(obj)); } catch { res.end(); }
 }
 
-function sendAnthropicError(res, status, type, message) {
+/** Per-request correlation id (BLZ-XXXXXX) — safe for logs, headers, errors. */
+function newRequestId() {
+  return 'BLZ-' + Math.random().toString(16).slice(2, 8).toUpperCase().padEnd(6, '0');
+}
+
+function sendAnthropicError(res, status, type, message, requestId) {
   sendJson(res, status, {
     type: 'error',
     error: { type, message: redactSecrets(String(message || 'Unknown error')) },
-  });
+    ...(requestId ? { request_id: requestId } : {}),
+  }, requestId);
 }
 
 /** Map classified errors to Anthropic error responses (S7 fix: no more 401→400). */
-function respondClassifiedError(res, cls, detail) {
+function respondClassifiedError(res, cls, detail, requestId) {
+  const withDetail = cls.message + (detail ? ` — ${String(detail).slice(0, 200)}` : '');
   switch (cls.kind) {
     case 'auth':
-      return sendAnthropicError(res, 401, 'authentication_error', cls.message);
+      return sendAnthropicError(res, 401, 'authentication_error', cls.message, requestId);
     case 'rate_limit':
-      return sendAnthropicError(res, 429, 'rate_limit_error', cls.message + (detail ? ` — ${String(detail).slice(0, 200)}` : ''));
+      return sendAnthropicError(res, 429, 'rate_limit_error', withDetail, requestId);
     case 'context_overflow':
-      return sendAnthropicError(res, 400, 'invalid_request_error', cls.message + (detail ? ` — ${String(detail).slice(0, 200)}` : ''));
+      return sendAnthropicError(res, 400, 'invalid_request_error', withDetail, requestId);
     case 'invalid_request':
     case 'payload_too_large':
-      return sendAnthropicError(res, 400, 'invalid_request_error', cls.message + (detail ? ` — ${String(detail).slice(0, 200)}` : ''));
+      return sendAnthropicError(res, 400, 'invalid_request_error', withDetail, requestId);
     case 'server':
-      return sendAnthropicError(res, 529, 'api_error', cls.message + (detail ? ` — ${String(detail).slice(0, 200)}` : ''));
+      return sendAnthropicError(res, 529, 'api_error', withDetail, requestId);
     default:
-      return sendAnthropicError(res, 502, 'api_error', cls.message + (detail ? ` — ${String(detail).slice(0, 200)}` : ''));
+      return sendAnthropicError(res, 502, 'api_error', withDetail, requestId);
   }
 }
 
-function respondOpenAIError(res, status, type, message) {
-  sendJson(res, status, { error: { message: redactSecrets(String(message || 'Unknown error')), type, code: type } });
+function respondOpenAIError(res, status, type, message, requestId) {
+  sendJson(res, status, {
+    error: { message: redactSecrets(String(message || 'Unknown error')), type, code: type },
+    ...(requestId ? { request_id: requestId } : {}),
+  }, requestId);
 }
 
 function isLocalOrigin(origin) {
@@ -214,10 +229,10 @@ export function createProxyServer({ keyring, stats, token }) {
     if (!effDef.baseUrl) return { status: 'not-configured', checkedAt: Date.now() };
     let key = '';
     if (def.requiresKey !== false) {
-      const entry = (await keyring.keysForProvider(providerId))[0];
-      if (!entry) return { status: 'no-key', checkedAt: Date.now() };
-      const full = await keyring.getKeyById(entry.id);
-      key = full?.key || '';
+      // Canonical credential resolution — never keys[0].
+      const cred = await resolveCredential({ keyring, providerId });
+      if (!cred) return { status: 'no-key', checkedAt: Date.now() };
+      key = cred.key;
     }
     return health.check(providerId, { def: effDef, key }, { force });
   }
@@ -381,12 +396,13 @@ export function createProxyServer({ keyring, stats, token }) {
 
   async function handleMessages(req, res, path) {
     const reqStart = Date.now();
+    const requestId = newRequestId();
     let raw;
     try {
       raw = await readBody(req);
     } catch (err) {
       if (err.code === 'BODY_TOO_LARGE') {
-        sendAnthropicError(res, 413, 'invalid_request_error', 'Request body too large (limit: 10 MB)');
+        sendAnthropicError(res, 413, 'invalid_request_error', 'Request body too large (limit: 10 MB)', requestId);
         return;
       }
       throw err;
@@ -396,8 +412,8 @@ export function createProxyServer({ keyring, stats, token }) {
     try {
       anthropicReq = JSON.parse(raw);
     } catch {
-      appendLog(`[${logTimestamp()}] ERROR 400 invalid_json ${path}`);
-      sendAnthropicError(res, 400, 'invalid_request_error', 'Invalid JSON in request body');
+      appendLog(`[${logTimestamp()}] ERROR 400 invalid_json ${path} req=${requestId}`);
+      sendAnthropicError(res, 400, 'invalid_request_error', 'Invalid JSON in request body', requestId);
       return;
     }
 
@@ -410,11 +426,11 @@ export function createProxyServer({ keyring, stats, token }) {
     for (const w of plan.warnings) log.warn(`[Router] ${w}`);
 
     if (plan.candidates.length === 0) {
-      sendAnthropicError(res, 503, 'api_error', 'No usable provider is configured. Add a key with: blitz add <api-key>');
+      sendAnthropicError(res, 503, 'api_error', 'No usable provider is configured. Add a key with: blitz add <api-key>', requestId);
       return;
     }
 
-    log.proxy('in', `model=${anthropicReq.model || 'default'} stream=${isStream} msgs=${anthropicReq.messages?.length || 0} tools=${anthropicReq.tools?.length || 0} candidates=${plan.candidates.length}`);
+    log.proxy('in', `model=${anthropicReq.model || 'default'} stream=${isStream} msgs=${anthropicReq.messages?.length || 0} tools=${anthropicReq.tools?.length || 0} candidates=${plan.candidates.length} req=${requestId}`);
 
     let lastCls = null;
     let lastDetail = '';
@@ -449,16 +465,20 @@ export function createProxyServer({ keyring, stats, token }) {
             providerId: cand.provider, model: cand.model, ok: false,
             status: response.status, latencyMs, rateLimited: cls.kind === 'rate_limit',
           });
-          appendLog(`[${logTimestamp()}] ERROR ${response.status} ${cls.kind} provider=${cand.provider} (${latencyMs}ms)`);
+          appendLog(`[${logTimestamp()}] ERROR ${response.status} ${cls.kind} provider=${cand.provider} (${latencyMs}ms) req=${requestId}`);
+
+          // Live 429: cool this credential down — rotation prefers others.
+          if (cls.kind === 'rate_limit') markCredentialRateLimited(cand.credentialId);
 
           const nextIdx = i + 1;
           const next = nextIdx < plan.candidates.length ? plan.candidates[nextIdx] : null;
 
-          // Key rotation: another stored key exists for the SAME provider.
+          // Key rotation: another stored credential exists for the SAME provider.
           // This is not a provider failover, so it happens even when
           // fallbackOnAuthError is false — and without poisoning health.
           if (cls.kind === 'auth' && next?.provider === cand.provider) {
-            appendLog(`[${logTimestamp()}] ROTATE ${cand.provider} key rejected → trying next key`);
+            markCredentialRejected(cand.credentialId);
+            appendLog(`[${logTimestamp()}] ROTATE ${cand.provider} key rejected → trying next key req=${requestId}`);
             lastCls = cls; lastDetail = errText;
             continue;
           }
@@ -466,27 +486,29 @@ export function createProxyServer({ keyring, stats, token }) {
           markProviderHealth(health, cand.provider, cls, response.status);
 
           if (cls.fallbackable && next) {
-            appendLog(`[${logTimestamp()}] FALLBACK ${cand.provider}→${next.provider} reason=${cls.kind}`);
+            appendLog(`[${logTimestamp()}] FALLBACK ${cand.provider}→${next.provider} reason=${cls.kind} req=${requestId}`);
             lastCls = cls; lastDetail = errText;
             continue;
           }
-          respondClassifiedError(res, cls, errText);
+          respondClassifiedError(res, cls, errText, requestId);
           return;
         }
 
         // ── Success: from here on, no provider switching mid-response ──
+        markCredentialHealthy(cand.credentialId);
         if (isStream) {
           res.writeHead(200, {
             'Content-Type': 'text/event-stream',
             'Cache-Control': 'no-cache',
             'Connection': 'keep-alive',
             'X-Accel-Buffering': 'no',
+            'X-Blitz-Request-Id': requestId,
           });
           const result = await translateStream(response.body, res, toolIdMap, anthropicReq.model || cand.model);
           response.__blitzTimers?.clear();
           const latencyMs = Date.now() - reqStart;
           if (result.errored) {
-            appendLog(`[${logTimestamp()}] ERROR stream-failed provider=${cand.provider} (${latencyMs}ms)`);
+            appendLog(`[${logTimestamp()}] ERROR stream-failed provider=${cand.provider} (${latencyMs}ms) req=${requestId}`);
             recordRequest(stats, {
               providerId: cand.provider, model: cand.model, ok: false,
               status: 502, latencyMs,
@@ -498,7 +520,7 @@ export function createProxyServer({ keyring, stats, token }) {
               inputTokens: result.inputTokens, outputTokens: result.outputTokens,
               fallbackTo: i > 0 ? plan.candidates[i - 1].provider : undefined,
             });
-            appendLog(`[${logTimestamp()}] POST ${path} → 200 OK (${latencyMs}ms) ${cand.provider}/${cand.model} [stream]`);
+            appendLog(`[${logTimestamp()}] POST ${path} → 200 OK (${latencyMs}ms) ${cand.provider}/${cand.model} [stream] req=${requestId}`);
           }
           return;
         }
@@ -514,9 +536,9 @@ export function createProxyServer({ keyring, stats, token }) {
           outputTokens: anthropicRes.usage.output_tokens,
           fallbackTo: i > 0 ? plan.candidates[i - 1].provider : undefined,
         });
-        appendLog(`[${logTimestamp()}] POST ${path} → 200 OK (${Date.now() - reqStart}ms) ${cand.provider}/${cand.model}`);
-        log.proxy('out', `stop=${anthropicRes.stop_reason} blocks=${anthropicRes.content.length} tokens=${anthropicRes.usage.output_tokens}`);
-        sendJson(res, 200, anthropicRes);
+        appendLog(`[${logTimestamp()}] POST ${path} → 200 OK (${Date.now() - reqStart}ms) ${cand.provider}/${cand.model} req=${requestId}`);
+        log.proxy('out', `stop=${anthropicRes.stop_reason} blocks=${anthropicRes.content.length} tokens=${anthropicRes.usage.output_tokens} req=${requestId}`);
+        sendJson(res, 200, anthropicRes, requestId);
         return;
 
       } catch (err) {
@@ -526,35 +548,36 @@ export function createProxyServer({ keyring, stats, token }) {
           providerId: cand.provider, model: cand.model, ok: false,
           status: 502, latencyMs,
         });
-        appendLog(`[${logTimestamp()}] ERROR ${cls.kind} provider=${cand.provider} (${latencyMs}ms)`);
+        appendLog(`[${logTimestamp()}] ERROR ${cls.kind} provider=${cand.provider} (${latencyMs}ms) req=${requestId}`);
         markProviderHealth(health, cand.provider, cls, 502);
 
         const nextIdx = i + 1;
         if (cls.fallbackable && nextIdx < plan.candidates.length) {
           const next = plan.candidates[nextIdx];
-          appendLog(`[${logTimestamp()}] FALLBACK ${cand.provider}→${next.provider} reason=${cls.kind}`);
+          appendLog(`[${logTimestamp()}] FALLBACK ${cand.provider}→${next.provider} reason=${cls.kind} req=${requestId}`);
           lastCls = cls; lastDetail = err.message;
           continue;
         }
-        respondClassifiedError(res, cls, err.message);
+        respondClassifiedError(res, cls, err.message, requestId);
         return;
       }
     }
 
-    if (lastCls) respondClassifiedError(res, lastCls, lastDetail);
-    else sendAnthropicError(res, 502, 'api_error', 'All providers failed');
+    if (lastCls) respondClassifiedError(res, lastCls, lastDetail, requestId);
+    else sendAnthropicError(res, 502, 'api_error', 'All providers failed', requestId);
   }
 
   // ─── OpenAI-compatible passthrough handler ───────────────────────────────
 
   async function handleChatCompletions(req, res, path) {
     const reqStart = Date.now();
+    const requestId = newRequestId();
     let raw;
     try {
       raw = await readBody(req);
     } catch (err) {
       if (err.code === 'BODY_TOO_LARGE') {
-        respondOpenAIError(res, 413, 'invalid_request', 'Request body too large');
+        respondOpenAIError(res, 413, 'invalid_request', 'Request body too large', requestId);
         return;
       }
       throw err;
@@ -563,7 +586,7 @@ export function createProxyServer({ keyring, stats, token }) {
     try {
       body = JSON.parse(raw);
     } catch {
-      respondOpenAIError(res, 400, 'invalid_request', 'Invalid JSON in request body');
+      respondOpenAIError(res, 400, 'invalid_request', 'Invalid JSON in request body', requestId);
       return;
     }
 
@@ -574,7 +597,7 @@ export function createProxyServer({ keyring, stats, token }) {
     const plan = await planCandidates({ cfg, keyring, needs, estTokens, health });
 
     if (plan.candidates.length === 0) {
-      respondOpenAIError(res, 503, 'api_error', 'No usable provider is configured');
+      respondOpenAIError(res, 503, 'api_error', 'No usable provider is configured', requestId);
       return;
     }
 
@@ -614,26 +637,30 @@ export function createProxyServer({ keyring, stats, token }) {
           const nextIdx = i + 1;
           const next = nextIdx < plan.candidates.length ? plan.candidates[nextIdx] : null;
           if (cls.kind === 'auth' && next?.provider === cand.provider) {
-            appendLog(`[${logTimestamp()}] ROTATE ${cand.provider} key rejected → trying next key`);
+            markCredentialRejected(cand.credentialId);
+            appendLog(`[${logTimestamp()}] ROTATE ${cand.provider} key rejected → trying next key req=${requestId}`);
             lastCls = cls;
             continue;
           }
+          if (cls.kind === 'rate_limit') markCredentialRateLimited(cand.credentialId);
           markProviderHealth(health, cand.provider, cls, response.status);
           if (cls.fallbackable && next) {
-            appendLog(`[${logTimestamp()}] FALLBACK ${cand.provider}→${next.provider} reason=${cls.kind}`);
+            appendLog(`[${logTimestamp()}] FALLBACK ${cand.provider}→${next.provider} reason=${cls.kind} req=${requestId}`);
             lastCls = cls;
             continue;
           }
-          respondOpenAIError(res, response.status, cls.kind, cls.message + (errText ? ` — ${errText.slice(0, 300)}` : ''));
+          respondOpenAIError(res, response.status, cls.kind, cls.message + (errText ? ` — ${errText.slice(0, 300)}` : ''), requestId);
           return;
         }
 
+        markCredentialHealthy(cand.credentialId);
         if (isStream) {
           res.writeHead(200, {
             'Content-Type': 'text/event-stream',
             'Cache-Control': 'no-cache',
             'Connection': 'keep-alive',
             'X-Accel-Buffering': 'no',
+            'X-Blitz-Request-Id': requestId,
           });
           const reader = response.body.getReader();
           try {
@@ -652,7 +679,7 @@ export function createProxyServer({ keyring, stats, token }) {
             latencyMs: Date.now() - reqStart,
             fallbackTo: i > 0 ? plan.candidates[i - 1].provider : undefined,
           });
-          appendLog(`[${logTimestamp()}] POST ${path} → 200 OK (${Date.now() - reqStart}ms) ${cand.provider}/${cand.model} [stream|openai]`);
+          appendLog(`[${logTimestamp()}] POST ${path} → 200 OK (${Date.now() - reqStart}ms) ${cand.provider}/${cand.model} [stream|openai] req=${requestId}`);
           return;
         }
 
@@ -669,8 +696,8 @@ export function createProxyServer({ keyring, stats, token }) {
           inputTokens: usage?.prompt_tokens, outputTokens: usage?.completion_tokens,
           fallbackTo: i > 0 ? plan.candidates[i - 1].provider : undefined,
         });
-        appendLog(`[${logTimestamp()}] POST ${path} → 200 OK (${Date.now() - reqStart}ms) ${cand.provider}/${cand.model} [openai]`);
-        if (!res.headersSent) res.writeHead(200, { 'Content-Type': 'application/json' });
+        appendLog(`[${logTimestamp()}] POST ${path} → 200 OK (${Date.now() - reqStart}ms) ${cand.provider}/${cand.model} [openai] req=${requestId}`);
+        if (!res.headersSent) res.writeHead(200, { 'Content-Type': 'application/json', 'X-Blitz-Request-Id': requestId });
         res.end(text);
         return;
 
@@ -683,29 +710,30 @@ export function createProxyServer({ keyring, stats, token }) {
         markProviderHealth(health, cand.provider, cls, 502);
         const nextIdx = i + 1;
         if (cls.fallbackable && nextIdx < plan.candidates.length) {
-          appendLog(`[${logTimestamp()}] FALLBACK ${cand.provider}→${plan.candidates[nextIdx].provider} reason=${cls.kind}`);
+          appendLog(`[${logTimestamp()}] FALLBACK ${cand.provider}→${plan.candidates[nextIdx].provider} reason=${cls.kind} req=${requestId}`);
           lastCls = cls;
           continue;
         }
-        respondOpenAIError(res, 502, cls.kind, cls.message);
+        respondOpenAIError(res, 502, cls.kind, cls.message, requestId);
         return;
       }
     }
 
-    if (lastCls) respondOpenAIError(res, 502, lastCls.kind, lastCls.message);
-    else respondOpenAIError(res, 502, 'api_error', 'All providers failed');
+    if (lastCls) respondOpenAIError(res, 502, lastCls.kind, lastCls.message, requestId);
+    else respondOpenAIError(res, 502, 'api_error', 'All providers failed', requestId);
   }
 
   // ─── OpenAI Responses API handler (Codex CLI) ─────────────────────────────
 
   async function handleResponses(req, res, path) {
     const reqStart = Date.now();
+    const requestId = newRequestId();
     let raw;
     try {
       raw = await readBody(req);
     } catch (err) {
       if (err.code === 'BODY_TOO_LARGE') {
-        respondOpenAIError(res, 413, 'invalid_request', 'Request body too large');
+        respondOpenAIError(res, 413, 'invalid_request', 'Request body too large', requestId);
         return;
       }
       throw err;
@@ -714,7 +742,7 @@ export function createProxyServer({ keyring, stats, token }) {
     try {
       responsesReq = JSON.parse(raw);
     } catch {
-      respondOpenAIError(res, 400, 'invalid_request', 'Invalid JSON in request body');
+      respondOpenAIError(res, 400, 'invalid_request', 'Invalid JSON in request body', requestId);
       return;
     }
 
@@ -733,7 +761,7 @@ export function createProxyServer({ keyring, stats, token }) {
     const plan = await planCandidates({ cfg, keyring, needs, estTokens, health });
 
     if (plan.candidates.length === 0) {
-      respondOpenAIError(res, 503, 'api_error', 'No usable provider is configured');
+      respondOpenAIError(res, 503, 'api_error', 'No usable provider is configured', requestId);
       return;
     }
 
@@ -773,26 +801,30 @@ export function createProxyServer({ keyring, stats, token }) {
           const nextIdx = i + 1;
           const next = nextIdx < plan.candidates.length ? plan.candidates[nextIdx] : null;
           if (cls.kind === 'auth' && next?.provider === cand.provider) {
-            appendLog(`[${logTimestamp()}] ROTATE ${cand.provider} key rejected → trying next key`);
+            markCredentialRejected(cand.credentialId);
+            appendLog(`[${logTimestamp()}] ROTATE ${cand.provider} key rejected → trying next key req=${requestId}`);
             lastCls = cls;
             continue;
           }
+          if (cls.kind === 'rate_limit') markCredentialRateLimited(cand.credentialId);
           markProviderHealth(health, cand.provider, cls, response.status);
           if (cls.fallbackable && next) {
-            appendLog(`[${logTimestamp()}] FALLBACK ${cand.provider}→${next.provider} reason=${cls.kind}`);
+            appendLog(`[${logTimestamp()}] FALLBACK ${cand.provider}→${next.provider} reason=${cls.kind} req=${requestId}`);
             lastCls = cls;
             continue;
           }
-          respondOpenAIError(res, response.status, cls.kind, cls.message + (errText ? ` — ${errText.slice(0, 300)}` : ''));
+          respondOpenAIError(res, response.status, cls.kind, cls.message + (errText ? ` — ${errText.slice(0, 300)}` : ''), requestId);
           return;
         }
 
+        markCredentialHealthy(cand.credentialId);
         if (isStream) {
           res.writeHead(200, {
             'Content-Type': 'text/event-stream',
             'Cache-Control': 'no-cache',
             'Connection': 'keep-alive',
             'X-Accel-Buffering': 'no',
+            'X-Blitz-Request-Id': requestId,
           });
           const result = await translateResponsesStream(response.body, res, responsesReq.model || cand.model);
           response.__blitzTimers?.clear();
@@ -804,7 +836,7 @@ export function createProxyServer({ keyring, stats, token }) {
             inputTokens: result.inputTokens, outputTokens: result.outputTokens,
             fallbackTo: i > 0 ? plan.candidates[i - 1].provider : undefined,
           });
-          appendLog(`[${logTimestamp()}] POST ${path} → ${result.errored ? 'STREAM-ERROR' : '200 OK'} (${latencyMs}ms) ${cand.provider}/${cand.model} [responses|stream]`);
+          appendLog(`[${logTimestamp()}] POST ${path} → ${result.errored ? 'STREAM-ERROR' : '200 OK'} (${latencyMs}ms) ${cand.provider}/${cand.model} [responses|stream] req=${requestId}`);
           return;
         }
 
@@ -818,8 +850,8 @@ export function createProxyServer({ keyring, stats, token }) {
           inputTokens: out.usage.input_tokens, outputTokens: out.usage.output_tokens,
           fallbackTo: i > 0 ? plan.candidates[i - 1].provider : undefined,
         });
-        appendLog(`[${logTimestamp()}] POST ${path} → 200 OK (${Date.now() - reqStart}ms) ${cand.provider}/${cand.model} [responses]`);
-        sendJson(res, 200, out);
+        appendLog(`[${logTimestamp()}] POST ${path} → 200 OK (${Date.now() - reqStart}ms) ${cand.provider}/${cand.model} [responses] req=${requestId}`);
+        sendJson(res, 200, out, requestId);
         return;
 
       } catch (err) {
@@ -831,17 +863,17 @@ export function createProxyServer({ keyring, stats, token }) {
         markProviderHealth(health, cand.provider, cls, 502);
         const nextIdx = i + 1;
         if (cls.fallbackable && nextIdx < plan.candidates.length) {
-          appendLog(`[${logTimestamp()}] FALLBACK ${cand.provider}→${plan.candidates[nextIdx].provider} reason=${cls.kind}`);
+          appendLog(`[${logTimestamp()}] FALLBACK ${cand.provider}→${plan.candidates[nextIdx].provider} reason=${cls.kind} req=${requestId}`);
           lastCls = cls;
           continue;
         }
-        respondOpenAIError(res, 502, cls.kind, cls.message);
+        respondOpenAIError(res, 502, cls.kind, cls.message, requestId);
         return;
       }
     }
 
-    if (lastCls) respondOpenAIError(res, 502, lastCls.kind, lastCls.message);
-    else respondOpenAIError(res, 502, 'api_error', 'All providers failed');
+    if (lastCls) respondOpenAIError(res, 502, lastCls.kind, lastCls.message, requestId);
+    else respondOpenAIError(res, 502, 'api_error', 'All providers failed', requestId);
   }
 
   // ─── Models & token counting ─────────────────────────────────────────────
@@ -859,6 +891,13 @@ export function createProxyServer({ keyring, stats, token }) {
     if (def && def.models) {
       for (const id of Object.keys(def.models)) {
         data.push({ id, object: 'model', owned_by: def.name });
+      }
+    }
+    // Plus models discovered from the provider's live /models endpoint
+    // (cached in config — this endpoint never performs discovery itself).
+    if (cfg.provider) {
+      for (const id of newDiscoveredIds(cfg.discoveredModels, cfg.provider, def?.models ? Object.keys(def.models) : [])) {
+        data.push({ id, object: 'model', owned_by: def?.name || cfg.provider });
       }
     }
     sendJson(res, 200, { object: 'list', data });

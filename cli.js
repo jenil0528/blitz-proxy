@@ -20,6 +20,10 @@ import { listProfiles, resolveProfileChain } from './src/routing/profiles.js';
 import { formatHealth } from './src/routing/health.js';
 import { createStats } from './src/stats.js';
 import { resolveActiveProvider, availableProviders } from './src/routing/router.js';
+import { resolveCredential, resolveCredentials } from './src/credentials.js';
+import { validateConfig, formatValidation } from './src/config-validate.js';
+import { mergeDiscovered, discoveredList } from './src/models-cache.js';
+import { resolveAlias, listAliases, validateAliasValue, ALIAS_RE } from './src/aliases.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const HOME = process.env.BLITZ_HOME || join(homedir(), '.blitzproxy');
@@ -61,11 +65,24 @@ async function main() {
 
     // ── Providers & models ──
     case 'model':          return await cmdModel(args);
+    case 'models':         return await cmdModels(args);
+    case 'alias':
+    case 'aliases':        return await cmdAlias(args);
     case 'provider':
     case 'providers':      return await cmdProvider(args);
     case 'test':           return await cmdTest();
     case 'health':         return await cmdHealth();
     case 'auto':           return cmdAuto(args);
+
+    // ── Credentials ──
+    case 'credential':
+    case 'credentials':    return await cmdCredential(args);
+
+    // ── Agent launchers (shortcuts for blitz run <agent>) ──
+    case 'claude':         return await cmdRun(['claude', ...args]);
+    case 'opencode':       return await cmdRun(['opencode', ...args]);
+    case 'codex':          return await cmdRun(['codex', ...args]);
+    case 'aider':          return await cmdRun(['aider', ...args]);
 
     // ── Routing ──
     case 'profile':
@@ -82,7 +99,7 @@ async function main() {
 
     // ── Insight ──
     case 'stats':          return await cmdStats();
-    case 'config':         return cmdConfig(args);
+    case 'config':         return await cmdConfig(args);
     case 'privacy':        return cmdPrivacy();
     case 'token':          return await cmdToken();
     case 'dashboard':      return await cmdDashboard();
@@ -257,15 +274,36 @@ async function cmdStatus() {
   const cfg = getConfig();
   const running = await probeServer(cfg);
   const active = await resolveActiveProvider(cfg, keyring);
+  const keys = await keyring.listKeys();
+  const activeCred = await resolveCredential({ keyring, providerId: active.providerId });
+
+  // Registry counts: catalog + discovered models across usable providers
+  const avail = await availableProviders(cfg, keyring);
+  let modelCount = 0;
+  let providerCount = 0;
+  for (const pid of avail) {
+    const def = resolveProvider(pid, cfg);
+    if (!def) continue;
+    providerCount += 1;
+    modelCount += Object.keys(def.models || {}).length;
+    modelCount += discoveredList(cfg.discoveredModels, pid).filter(m => !(def.models && m.id in def.models)).length;
+  }
 
   console.log(`\n${C.b}⚡ BlitzProxy Status${C.r}\n`);
-  console.log(`  Server:    ${running ? `${C.grn}running` : `${C.red}stopped`}${C.r}  ${running ? `(${serverUrl(cfg)})` : ''}`);
-  console.log(`  Provider:  ${C.grn}${active.def?.name || active.providerId}${C.r}`);
-  console.log(`  Model:     ${C.blu}${active.model || '—'}${C.r}`);
-  console.log(`  Routing:   ${cfg.profile ? `profile:${cfg.profile}` : cfg.routing}${cfg.fallbackChain.length ? `  •  fallback: ${cfg.fallbackChain.join(' → ')}` : ''}`);
-  console.log(`  Keys:      ${await keyring.keyCount()} in ${globalThis.__blitzMode} keyring`);
-  console.log(`  Privacy:   ${cfg.privacy ? `${C.grn}ON${C.r}` : 'off'}`);
-  console.log(`  Config:    ${CONFIG_PATH}\n`);
+  console.log(`  ${C.b}Gateway${C.r}`);
+  console.log(`    Running:      ${running ? `${C.grn}YES${C.r} (${serverUrl(cfg)})` : `${C.red}stopped${C.r}`}`);
+  console.log(`    Auth:         /v1 ${cfg.requireAuth ? 'token required' : 'open (localhost only)'}  •  admin/dashboard: token`);
+  console.log(`    Endpoints:    Anthropic ${C.grn}✓${C.r}  OpenAI Chat ${C.grn}✓${C.r}  Responses ${C.grn}✓${C.r}  Models ${C.grn}✓${C.r}`);
+  console.log(`  ${C.b}Active route${C.r}`);
+  console.log(`    Provider:     ${C.grn}${active.def?.name || active.providerId}${C.r}`);
+  console.log(`    Model:        ${C.blu}${active.model || '—'}${C.r}`);
+  console.log(`    Credential:   ${activeCred ? activeCred.name : C.d + '(none)' + C.r}`);
+  console.log(`    Routing:      ${cfg.profile ? `profile:${cfg.profile}` : cfg.routing}${cfg.fallbackChain.length ? `  •  fallback: ${cfg.fallbackChain.join(' → ')}` : ''}`);
+  console.log(`  ${C.b}Registry${C.r}`);
+  console.log(`    Providers:    ${providerCount} usable (${avail.length ? avail.join(', ') : '—'})`);
+  console.log(`    Credentials:  ${keys.length} in ${globalThis.__blitzMode} keyring${keys.some(k => k.provider === active.providerId && k.id !== activeCred?.id) ? '  •  rotation ready' : ''}`);
+  console.log(`    Models:       ${modelCount}${Object.keys(cfg.aliases || {}).length ? `  •  aliases: ${Object.keys(cfg.aliases).join(', ')}` : ''}`);
+  console.log(`    Privacy:      ${cfg.privacy ? `${C.grn}ON${C.r}` : 'off'}  •  Config: ${CONFIG_PATH}\n`);
 }
 
 // ─── blitz run / blitz shell (no global env hijack) ──────────────────────────
@@ -465,20 +503,44 @@ async function cmdKeys() {
 }
 
 async function cmdSwitch(args) {
+  const cfg0 = getConfig();
+  const input = args[0];
+
+  // `blitz use <provider>/<model>` and aliases switch the ACTIVE MODEL only —
+  // the credential never changes. Plain numbers/names keep switching keys.
+  if (input && isNaN(parseInt(input, 10))) {
+    const target = resolveAlias(cfg0, input) || input;
+    const slashIdx = target.indexOf('/');
+    if (slashIdx > 0) {
+      const candidateProvider = target.slice(0, slashIdx);
+      if (allProviderIds(cfg0).includes(candidateProvider)) {
+        const providerId = candidateProvider;
+        const model = target.slice(slashIdx + 1);
+        const def = resolveProvider(providerId, cfg0);
+        if (def?.requiresKey !== false && !(await keyring.hasProvider(providerId))) {
+          console.log(`${C.yel}⚠ No credential stored for ${providerId} — requests will fail until: blitz add <key> --provider=${providerId}${C.r}`);
+        }
+        await saveConfig({ provider: providerId, model, profile: '' });
+        console.log(`${C.grn}✓ Model set: ${C.b}${model}${C.r} ${C.d}(${providerId})${C.r}`);
+        console.log(`${C.d}  Credentials are untouched — switching models never switches keys.${C.r}`);
+        return;
+      }
+    }
+  }
+
   const keys = await keyring.listKeys();
   if (keys.length === 0) {
     console.log(`${C.yel}No keys saved. Add one: blitz add <key>${C.r}`);
     process.exit(1);
   }
 
-  const input = args[0];
   if (!input) {
     console.log(`\n${C.b}Choose a key:${C.r}\n`);
     keys.forEach((k, i) => {
       const active = k.isActive ? `${C.grn}● ` : '  ';
       console.log(`${active}${i + 1}) ${k.name} ${C.d}(${k.providerName})${C.r}`);
     });
-    console.log(`\n${C.d}Usage: blitz switch <number or name>${C.r}\n`);
+    console.log(`\n${C.d}Usage: blitz switch <number or name>   •   blitz use <provider/model> to switch models${C.r}\n`);
     return;
   }
 
@@ -490,7 +552,8 @@ async function cmdSwitch(args) {
 
   if (!target) {
     console.log(`${C.red}✕ Key not found: ${input}${C.r}`);
-    console.log(`${C.d}  Run "blitz keys" to see available keys${C.r}`);
+    console.log(`${C.d}  Run "blitz keys" to see stored credentials${C.r}`);
+    console.log(`${C.d}  Or switch models with: blitz use <provider>/<model>${C.r}`);
     process.exit(1);
   }
 
@@ -579,8 +642,9 @@ async function cmdValidate(args) {
   const adapter = getAdapter(def);
   let key = '';
   if (def.requiresKey !== false) {
-    const entry = (await keyring.keysForProvider(providerId))[0];
-    if (entry) key = (await keyring.getKeyById(entry.id))?.key || '';
+    // Canonical credential resolution — never keys[0].
+    const cred = await resolveCredential({ keyring, providerId });
+    key = cred?.key || '';
   }
   console.log(`${C.d}Validating key for ${def.name} via ${def.baseUrl}...${C.r}`);
   const result = await adapter.validateKey({ def, key });
@@ -781,6 +845,203 @@ async function cmdModel(args) {
   console.log(`${C.grn}✓ Model set: ${C.b}${newModel}${C.r} ${C.d}(${providerId})${C.r}`);
 }
 
+// ─── blitz models: registry view, search, info, discovery ────────────────────
+
+async function cmdModels(args) {
+  const cfg = getConfig();
+  const sub = (args[0] || 'list').toLowerCase();
+
+  if (sub === 'refresh') {
+    return await cmdModelsRefresh(args.slice(1));
+  }
+
+  // Build the registry view: catalog + discovered models per provider with a
+  // credential or no-key requirement.
+  const avail = await availableProviders(cfg, keyring);
+  const rows = [];
+  for (const pid of avail) {
+    const def = resolveProvider(pid, cfg);
+    if (!def) continue;
+    for (const [id, info] of Object.entries(def.models || {})) {
+      rows.push({ provider: pid, id, caps: info, source: 'catalog' });
+    }
+    for (const m of discoveredList(cfg.discoveredModels, pid)) {
+      if (def.models && m.id in def.models) continue;
+      rows.push({ provider: pid, id: m.id, caps: null, source: 'discovered', lastSeen: m.lastSeen });
+    }
+  }
+
+  const query = (args[0] && sub !== 'list' && sub !== 'info') ? args.slice(sub === 'search' ? 1 : 0).join(' ').toLowerCase() : null;
+  const filtered = sub === 'search'
+    ? rows.filter(r => r.id.toLowerCase().includes((args[1] || '').toLowerCase()))
+    : (sub === 'info' ? rows : (query ? rows.filter(r => r.id.toLowerCase().includes(query)) : rows));
+
+  if (sub === 'info') {
+    const id = args.slice(1).join(' ');
+    const row = rows.find(r => r.id === id) || rows.find(r => r.id.toLowerCase().includes(id.toLowerCase()));
+    if (!row) {
+      console.log(`${C.red}✕ Model not found: ${args.slice(1).join(' ')}${C.r}`);
+      console.log(`${C.d}  Try: blitz models search <query>${C.r}`);
+      process.exit(1);
+    }
+    const def = resolveProvider(row.provider, cfg);
+    console.log(`\n${C.b}${row.id}${C.r} ${C.d}(${row.provider})${C.r}`);
+    console.log(`  Provider:     ${def?.name || row.provider}`);
+    console.log(`  Source:       ${row.source}${row.lastSeen ? ` • seen ${row.lastSeen.slice(0, 10)}` : ''}`);
+    if (row.caps) {
+      const caps = [
+        row.caps.tools ? 'tools' : null,
+        row.caps.vision ? 'vision' : null,
+        row.caps.reasoning ? 'reasoning' : null,
+        row.caps.contextWindow ? `${(row.caps.contextWindow / 1024) | 0}k context` : null,
+      ].filter(Boolean);
+      console.log(`  Capabilities: ${caps.length ? caps.join(', ') : 'text only'}`);
+    } else {
+      console.log(`  Capabilities: unknown (discovered — never fabricated)`);
+    }
+    console.log(`  Active:       ${cfg.provider === row.provider && cfg.model === row.id ? `${C.grn}yes${C.r}` : 'no'}\n`);
+    return;
+  }
+
+  console.log(`\n${C.b}Models${C.r}  ${C.d}${filtered.length} across ${new Set(filtered.map(r => r.provider)).size} provider(s)${C.r}\n`);
+  for (const r of filtered) {
+    const isActive = cfg.provider === r.provider && cfg.model === r.id;
+    const marker = isActive ? `${C.grn}● ` : '  ';
+    const caps = r.caps ? [
+      r.caps.tools ? 'tools' : null,
+      r.caps.vision ? 'vision' : null,
+      r.caps.reasoning ? 'reasoning' : null,
+    ].filter(Boolean).join(' ') : '';
+    console.log(`${marker}${r.id}${C.r} ${C.d}${r.provider}${C.r}${caps ? ` ${C.d}${caps}${C.r}` : ''}${isActive ? ` ${C.grn}ACTIVE${C.r}` : ''}${r.source === 'discovered' ? ` ${C.d}[discovered]${C.r}` : ''}`);
+  }
+  console.log(`\n${C.d}Use: blitz use <provider>/<model>   •   Refresh: blitz models refresh${C.r}\n`);
+}
+
+async function cmdModelsRefresh(args) {
+  const cfg = getConfig();
+  const providerId = args[0]?.toLowerCase() || cfg.provider;
+  if (!providerId) {
+    console.log(`${C.yel}No provider specified and none is active. Usage: blitz models refresh <provider>${C.r}`);
+    process.exit(1);
+  }
+  const def = resolveProvider(providerId, cfg);
+  if (!def || !def.baseUrl) {
+    console.log(`${C.red}✕ Unknown or unconfigured provider: ${providerId}${C.r}`);
+    process.exit(1);
+  }
+  if (def.requiresKey !== false) {
+    const cred = await resolveCredential({ keyring, providerId });
+    if (!cred) {
+      console.log(`${C.red}✕ No credential stored for ${providerId} — add one first: blitz add <key> --provider=${providerId}${C.r}`);
+      process.exit(1);
+    }
+    console.log(`${C.d}Discovering models for ${def.name} with credential ${cred.name}…${C.r}`);
+    const adapter = getAdapter(def);
+    try {
+      const ids = await adapter.listModels({ def, key: cred.key });
+      const discoveredModels = mergeDiscovered(cfg.discoveredModels, providerId, ids);
+      const known = new Set([...Object.keys(def.models || {}), ...discoveredModels[providerId].models.map(m => m.id)]);
+      saveConfig({ discoveredModels });
+      console.log(`${C.grn}✓ ${ids.length} models discovered for ${def.name}${C.r}`);
+      console.log(`${C.d}  Cached in config — surfaced in blitz models and GET /v1/models.${C.r}`);
+      console.log(`${C.d}  Manual catalog entries are preserved; capabilities are never fabricated.${C.r}`);
+    } catch (err) {
+      console.log(`${C.yel}⚠ Discovery failed: ${err.message}${C.r}`);
+      console.log(`${C.d}  Existing models are untouched. Add manually with:${C.r}`);
+      console.log(`${C.d}  blitz use ${providerId}/<model-id>${C.r}`);
+      process.exit(1);
+    }
+    return;
+  }
+  // no-key provider (ollama)
+  const adapter = getAdapter(def);
+  try {
+    const ids = await adapter.listModels({ def, key: '' });
+    const discoveredModels = mergeDiscovered(cfg.discoveredModels, providerId, ids);
+    saveConfig({ discoveredModels });
+    console.log(`${C.grn}✓ ${ids.length} models discovered for ${def.name}${C.r}`);
+  } catch (err) {
+    console.log(`${C.yel}⚠ Discovery failed: ${err.message} — existing models kept${C.r}`);
+    process.exit(1);
+  }
+}
+
+// ─── blitz alias: short names for provider/model pairs ──────────────────────
+
+async function cmdAlias(args) {
+  const cfg = getConfig();
+  const sub = (args[0] || 'list').toLowerCase();
+
+  if (sub === 'set') {
+    const [name, value] = args.slice(1);
+    if (!name || !value) {
+      console.log(`${C.red}✕ Usage: blitz alias set <name> <provider/model>${C.r}`);
+      console.log(`${C.d}  Example: blitz alias set coding nvidia/z-ai/glm-5.3${C.r}`);
+      process.exit(1);
+    }
+    if (!ALIAS_RE.test(name)) {
+      console.log(`${C.red}✕ Alias names: lowercase letters, digits, dashes; max 32 chars${C.r}`);
+      process.exit(1);
+    }
+    const err = validateAliasValue(value, allProviderIds(cfg));
+    if (err) {
+      console.log(`${C.red}✕ ${err}${C.r}`);
+      process.exit(1);
+    }
+    saveConfig({ aliases: { ...cfg.aliases, [name]: value } });
+    console.log(`${C.grn}✓ Alias set: ${C.b}${name}${C.r} ${C.d}→ ${value}${C.r}`);
+    console.log(`${C.d}  Use it: blitz use ${name}${C.r}`);
+    return;
+  }
+  if (sub === 'remove' || sub === 'rm') {
+    const name = args[1];
+    if (!cfg.aliases?.[name]) {
+      console.log(`${C.yel}No alias named "${name}"${C.r}`);
+      process.exit(1);
+    }
+    const aliases = { ...cfg.aliases };
+    delete aliases[name];
+    saveConfig({ aliases });
+    console.log(`${C.grn}✓ Removed alias: ${name}${C.r}`);
+    return;
+  }
+  if (sub === 'list' || sub === 'show') {
+    const all = listAliases(cfg);
+    if (all.length === 0) {
+      console.log(`${C.d}No aliases configured.${C.r}`);
+      console.log(`${C.d}Create one: blitz alias set coding nvidia/z-ai/glm-5.3${C.r}\n`);
+      return;
+    }
+    console.log(`\n${C.b}Aliases${C.r}\n`);
+    for (const a of all) {
+      const active = cfg.provider && a.value === `${cfg.provider}/${cfg.model}`;
+      console.log(`  ${C.b}${a.name.padEnd(16)}${C.r}${C.d}→${C.r} ${a.value}${active ? ` ${C.grn}ACTIVE${C.r}` : ''}`);
+    }
+    console.log(`\n${C.d}Use: blitz use <alias>   •   Set: blitz alias set <name> <provider/model>${C.r}\n`);
+    return;
+  }
+  console.log(`${C.d}Usage: blitz alias [list | set <name> <provider/model> | remove <name>]${C.r}`);
+}
+
+// ─── blitz credential(s): unified credential management ──────────────────────
+
+async function cmdCredential(args) {
+  const sub = (args[0] || 'list').toLowerCase();
+  const rest = args.slice(1);
+  switch (sub) {
+    case 'add':     return await cmdAdd(rest);
+    case 'list':
+    case 'show':    return await cmdKeys();
+    case 'use':     return await cmdSwitch(rest);
+    case 'test':    return await cmdValidate(rest);
+    case 'remove':
+    case 'rm':      return await cmdRemove(rest);
+    default:
+      console.log(`${C.d}Usage: blitz credential [add | list | use <n> | test [provider] | remove <n>]${C.r}`);
+      console.log(`${C.d}  (aliases: blitz add / keys / switch / validate / rm)${C.r}`);
+  }
+}
+
 async function cmdTest() {
   const cfg = getConfig();
   const active = await resolveActiveProvider(cfg, keyring);
@@ -835,9 +1096,10 @@ async function cmdHealth() {
     const adapter = getAdapter(effDef);
     let key = '';
     if (def.requiresKey !== false) {
-      const entry = (await keyring.keysForProvider(id))[0];
-      if (!entry) { rows.push({ id, label: 'NO-KEY', color: 'dim' }); continue; }
-      key = (await keyring.getKeyById(entry.id))?.key || '';
+      // Canonical credential resolution — never keys[0].
+      const cred = await resolveCredential({ keyring, providerId: id });
+      if (!cred) { rows.push({ id, label: 'NO-KEY', color: 'dim' }); continue; }
+      key = cred.key;
     }
     const h = await adapter.healthCheck({ def: effDef, key, deep: true });
     const f = formatHealth(h);
@@ -1000,9 +1262,37 @@ const CONFIG_KEYS = new Set([
   'healthTtlMs', 'customBaseUrl', 'fallbackChain', 'fallbackOnAuthError',
 ]);
 
-function cmdConfig(args) {
+async function cmdConfig(args) {
   const cfg = getConfig();
   const sub = (args[0] || 'show').toLowerCase();
+
+  if (sub === 'validate') {
+    // Syntax: re-parse the file from disk exactly as the server would.
+    let syntaxOk = true;
+    let syntaxErr = '';
+    try {
+      JSON.parse(readFileSync(CONFIG_PATH, 'utf-8'));
+    } catch (e) {
+      syntaxOk = false;
+      syntaxErr = e.message;
+    }
+    if (!syntaxOk) {
+      console.log(`${C.red}✗ Configuration syntax${C.r}`);
+      console.log(`    ${syntaxErr}`);
+      console.log(`\n${C.red}Configuration is INVALID — fix the error above. (${CONFIG_PATH})${C.r}`);
+      process.exit(1);
+    }
+    const result = validateConfig(getConfig(), { credentials: await keyring.listKeys() });
+    console.log(`\n${C.b}Validating ${CONFIG_PATH}${C.r}\n`);
+    console.log(`${C.grn}✓${C.r} Configuration syntax`);
+    const out = formatValidation(result)
+      .replace(/^✗ /gm, `${C.red}✗ ${C.r}`)
+      .replace(/^⚠ /gm, `${C.yel}⚠ ${C.r}`)
+      .replace(/Configuration is INVALID/g, `${C.red}Configuration is INVALID${C.r}`)
+      .replace(/Configuration is valid/g, `${C.grn}Configuration is valid${C.r}`);
+    console.log(out);
+    process.exit(result.ok ? 0 : 1);
+  }
 
   if (sub === 'show') {
     console.log(`\n${C.b}BlitzProxy Configuration${C.r}  ${C.d}${CONFIG_PATH}${C.r}\n`);

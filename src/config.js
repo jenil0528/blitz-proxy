@@ -46,16 +46,18 @@ export const DEFAULT_CONFIG = {
   model: '',
   routing: 'manual',            // 'manual' | 'auto'
   profile: '',                  // '' | coding | fast | free | local | <custom>
-  profiles: {},                 // user-defined profiles
+  profiles: {},                  // user-defined profiles
+  aliases: {},                   // { name: '<provider>/<model>' } — blitz use <alias>
+  discoveredModels: {},          // { providerId: { models: [{id, lastSeen}], fetchedAt } }
   fallbackChain: [],             // provider ids tried after the active provider
-  fallbackModels: {},           // { providerId: modelId } per-fallback model
-  fallbackOnAuthError: false,   // auth failures do NOT failover by default
+  fallbackModels: {},            // { providerId: modelId } per-fallback model
+  fallbackOnAuthError: false,    // auth failures do NOT failover by default
   proxyPort: 4819,
-  host: '127.0.0.1',            // local-first; never 0.0.0.0 by default
-  requireAuth: false,           // token required for /v1/* (admin always requires it)
+  host: '127.0.0.1',             // local-first; never 0.0.0.0 by default
+  requireAuth: false,            // token required for /v1/* (admin always requires it)
   customBaseUrl: '',
   customHeaders: {},
-  customProviders: {},          // user-defined provider definitions
+  customProviders: {},           // user-defined provider definitions
   maxRetries: 3,
   retryBaseDelay: 500,
   logRequests: true,

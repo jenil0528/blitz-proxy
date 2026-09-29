@@ -22,6 +22,9 @@ const suites = [
   'config.test.js',
   'router.test.js',
   'adapter.test.js',
+  'credentials.test.js',
+  'validate.test.js',
+  'registry.test.js',
   'server.test.js',
 ];
 
