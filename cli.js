@@ -515,7 +515,13 @@ async function cmdSwitch(args) {
       const candidateProvider = target.slice(0, slashIdx);
       if (allProviderIds(cfg0).includes(candidateProvider)) {
         const providerId = candidateProvider;
-        const model = target.slice(slashIdx + 1);
+        let model = target.slice(slashIdx + 1);
+        // Model ids that begin with their own provider name (nvidia/nemotron-…)
+        // lose the prefix when split — restore the full catalog id when the
+        // stripped one is unknown and the prefixed one exists.
+        if (!findModelInfo(providerId, model) && findModelInfo(providerId, `${providerId}/${model}`)) {
+          model = `${providerId}/${model}`;
+        }
         const def = resolveProvider(providerId, cfg0);
         if (def?.requiresKey !== false && !(await keyring.hasProvider(providerId))) {
           console.log(`${C.yel}⚠ No credential stored for ${providerId} — requests will fail until: blitz add <key> --provider=${providerId}${C.r}`);
@@ -811,6 +817,12 @@ async function cmdModel(args) {
     if (candidateProvider !== active.providerId && allProviderIds(cfg).includes(candidateProvider)) {
       providerId = candidateProvider;
       newModel = input.slice(slashIdx + 1);
+      // Model ids that begin with their own provider name (nvidia/nemotron-…)
+      // lose the prefix when split — restore the full catalog id when the
+      // stripped one is unknown and the prefixed one exists.
+      if (!findModelInfo(providerId, newModel) && findModelInfo(providerId, `${providerId}/${newModel}`)) {
+        newModel = `${providerId}/${newModel}`;
+      }
       await saveConfig({ provider: providerId });
     }
   }
