@@ -26,11 +26,16 @@ import { mergeDiscovered, discoveredList } from './src/models-cache.js';
 import { resolveAlias, listAliases, validateAliasValue, ALIAS_RE } from './src/aliases.js';
 import { CONTEXT_MODES } from './src/context-optimizer.js';
 import { getCapabilities, capabilityMark, capabilityLabel, formatTokens } from './src/model-capabilities.js';
+import { AGENTS, claudeNativeSessions, resumeArgs } from './src/agents.js';
+import { createSessionStore } from './src/sessions.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const HOME = process.env.BLITZ_HOME || join(homedir(), '.blitzproxy');
 const PID_FILE = join(HOME, 'blitz.pid');
 const LOG_PATH = join(__dirname, 'blitz.log');
+
+// Session registry: recovery metadata only (no conversation content, no keys)
+const sessionStore = createSessionStore({ home: HOME });
 
 const C = {
   r: '\x1b[0m', b: '\x1b[1m', d: '\x1b[2m',
@@ -91,6 +96,9 @@ async function main() {
     case 'compatibility':  return await cmdCompatibility();
     case 'context':         return cmdContext(args);
     case 'usage':           return await cmdUsage(args);
+    case 'sessions':        return cmdSessions();
+    case 'session':         return await cmdSession(args);
+    case 'resume':          return await cmdResume(args);
 
     // ── Routing ──
     case 'profile':
@@ -543,12 +551,27 @@ async function cmdRun(args) {
   await ensureServer();
   const cfg = getConfig();
   const token = await getProxyToken(keyring);
+
+  // Session tracking: record launch metadata so `blitz sessions`/`blitz resume`
+  // can find this run later. Metadata only — never conversation content or keys.
+  const session = sessionStore.create({
+    agent: AGENTS[command]?.label || command,
+    projectDir: process.cwd(),
+    gitBranch: gitBranchIn(process.cwd()),
+    model: cfg.model,
+    profile: cfg.profile,
+    provider: cfg.provider,
+  });
+
   const child = spawn(command, args.slice(1), {
     stdio: 'inherit',
     env: blitzEnv(cfg, token),
     shell: process.platform === 'win32',
   });
+  if (child.pid) sessionStore.touch(session.id, { pid: child.pid });
+
   child.on('error', (err) => {
+    sessionStore.touch(session.id, { status: 'FAILED' });
     if (err.code === 'ENOENT') {
       console.error(`${C.red}✕ Command not found: ${command}${C.r}`);
       console.error(`${C.d}  Claude Code: npm install -g @anthropic-ai/claude-code${C.r}`);
@@ -557,7 +580,136 @@ async function cmdRun(args) {
     console.error(`${C.red}✕ ${err.message}${C.r}`);
     process.exit(1);
   });
-  child.on('exit', (code) => process.exit(code ?? 0));
+  child.on('exit', (code) => {
+    sessionStore.markExited(child.pid, code);
+    process.exit(code ?? 0);
+  });
+}
+
+/** Current git branch for session metadata — empty outside a repo. */
+function gitBranchIn(dir) {
+  try {
+    const r = spawnSync('git', ['-C', dir, 'rev-parse', '--abbrev-ref', 'HEAD'], {
+      encoding: 'utf-8', timeout: 3000, windowsHide: true,
+    });
+    if (r.status === 0) return (r.stdout || '').trim();
+  } catch { /* not a repo / git missing */ }
+  return '';
+}
+
+// ─── Sessions: discovery + resume ────────────────────────────────────────────
+
+function cmdSessions() {
+  const sessions = sessionStore.list();
+  const recoverable = sessions.filter(s => s.status === 'INTERRUPTED');
+  const active = sessions.filter(s => s.status === 'ACTIVE');
+  if (sessions.length === 0) {
+    console.log(`\n${C.d}No recorded sessions yet. Launch an agent through BLITZ to track one:${C.r}`);
+    console.log(`${C.d}  blitz claude   •   blitz run opencode   •   blitz codex${C.r}\n`);
+    return;
+  }
+  console.log(`\n${C.b}Sessions${C.r}  ${C.d}— recovery metadata only; conversations stay in the agent${C.r}\n`);
+  sessions.slice(0, 15).forEach((s, i) => {
+    const icon = s.status === 'ACTIVE' ? `${C.grn}●` : s.status === 'INTERRUPTED' ? `${C.red}⚠` : s.status === 'COMPLETED' ? `${C.d}✓` : `${C.d}·`;
+    const when = s.lastActivity ? relativeTime(s.lastActivity) : '—';
+    console.log(`${icon}${C.r} ${i + 1}) ${C.b}${s.projectName}${C.r}  ${C.d}${s.agent} • ${s.model || 'default'}${s.gitBranch ? ` • ${s.gitBranch}` : ''}${C.r}`);
+    console.log(`      ${C.d}${s.status} • ${when} • ${s.id}${s.projectDir ? ` • ${s.projectDir}` : ''}${C.r}`);
+  });
+  console.log(`\n${C.d}${active.length} active • ${recoverable.length} interrupted   —   resume: blitz resume <number or id>   •   cleanup: blitz session cleanup${C.r}\n`);
+}
+
+function relativeTime(iso) {
+  const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
+  if (s < 60) return 'just now';
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
+  return `${Math.floor(s / 86400)} d ago`;
+}
+
+async function cmdSession(args) {
+  const sub = (args[0] || '').toLowerCase();
+  const sessions = sessionStore.list();
+  if (sub === 'cleanup') {
+    const removed = sessionStore.cleanup(getConfig().sessionRetentionDays);
+    console.log(removed > 0
+      ? `${C.grn}✓ Removed ${removed} expired session record(s)${C.r}`
+      : `${C.d}Nothing expired to remove.${C.r}`);
+    return;
+  }
+  const input = args[0] === 'show' ? args[1] : args[0];
+  if (!input) return cmdSessions();
+  const target = sessions.find(s => s.id === input) || sessions[parseInt(input, 10) - 1];
+  if (!target) {
+    console.log(`${C.red}✕ Session not found: ${input}${C.r}`);
+    process.exit(1);
+  }
+  console.log(`\n${C.b}${target.projectName}${C.r}  ${C.d}${target.id}${C.r}\n`);
+  console.log(`  Agent:        ${target.agent}`);
+  console.log(`  Status:       ${target.status}`);
+  console.log(`  Project:      ${target.projectDir || '—'}`);
+  console.log(`  Branch:       ${target.gitBranch || '—'}`);
+  console.log(`  Model:        ${target.model || '—'}  ${C.d}(${target.provider || '—'}${target.profile ? ` • profile:${target.profile}` : ''})${C.r}`);
+  console.log(`  Started:      ${target.startedAt || '—'}`);
+  console.log(`  Last activity:${target.lastActivity || '—'}`);
+  const agentId = Object.keys(AGENTS).find(k => AGENTS[k].label === target.agent || k === target.agent);
+  if (agentId === 'claude' && target.projectDir) {
+    const native = claudeNativeSessions(target.projectDir);
+    if (native) console.log(`  Native session: ${C.d}${native[0].id} (Claude Code's own history — BLITZ never copies it)${C.r}`);
+  }
+  console.log(`\n  ${C.d}Resume: blitz resume ${target.id}${C.r}\n`);
+}
+
+async function cmdResume(args) {
+  const sessions = sessionStore.list();
+  const candidates = sessions.filter(s => s.status === 'INTERRUPTED' || s.status === 'ACTIVE');
+  if (candidates.length === 0) {
+    console.log(`${C.d}No resumable sessions recorded. Launch one: blitz claude${C.r}`);
+    return;
+  }
+  const input = args[0];
+  let target;
+  if (!input) {
+    console.log(`\n${C.b}Resumable sessions${C.r}\n`);
+    candidates.slice(0, 10).forEach((s, i) => {
+      console.log(`  ${i + 1}) ${C.b}${s.projectName}${C.r} ${C.d}${s.agent} • ${s.status} • ${s.model || 'default'}${C.r}`);
+    });
+    console.log(`\n${C.d}Resume one: blitz resume <number or id>${C.r}\n`);
+    return;
+  }
+  target = candidates.find(s => s.id === input) || candidates[parseInt(input, 10) - 1];
+  if (!target) {
+    console.log(`${C.red}✕ Session not found: ${input}${C.r}`);
+    process.exit(1);
+  }
+  if (!target.projectDir || !existsSync(target.projectDir)) {
+    console.log(`${C.red}✕ The project directory no longer exists: ${target.projectDir}${C.r}`);
+    process.exit(1);
+  }
+  const agentId = Object.keys(AGENTS).find(k => AGENTS[k].label === target.agent || k === target.agent);
+  const resume = agentId ? resumeArgs(agentId, target.projectDir) : null;
+  const command = agentId ? AGENTS[agentId].cmd : target.agent;
+  if (!resume) {
+    console.log(`${C.yel}Native resume is unavailable for ${target.agent} — relaunching it in the project instead.${C.r}`);
+  }
+  await ensureServer();
+  const cfg = getConfig();
+  const token = await getProxyToken(keyring);
+  console.log(`${C.d}Resuming ${target.projectName} (${target.agent}) in ${target.projectDir}${resume ? ' — native agent resume' : ''}${C.r}`);
+  const child = spawn(command, resume || [], {
+    cwd: target.projectDir,
+    stdio: 'inherit',
+    env: blitzEnv(cfg, token),
+    shell: process.platform === 'win32',
+  });
+  if (child.pid) sessionStore.touch(target.id, { status: 'ACTIVE', pid: child.pid });
+  child.on('error', err => {
+    console.error(`${C.red}✕ Failed to launch ${command}: ${err.message}${C.r}`);
+    process.exit(1);
+  });
+  child.on('exit', code => {
+    sessionStore.markExited(child.pid, code);
+    process.exit(code ?? 0);
+  });
 }
 
 async function cmdShell() {

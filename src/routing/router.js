@@ -274,6 +274,49 @@ export async function planCandidates({ cfg, keyring, needs, estTokens, health })
     return { candidates: [], warnings, source, needs, estTokens, fatalError };
   }
 
+  // ── Vision guard ──────────────────────────────────────────────────────────
+  // A request carrying images must NEVER be sent to a model that is KNOWN
+  // (catalog metadata) not to support image input. The upstream would either
+  // error cryptically or produce garbage — the user sees an unclear
+  // "Cannot read image.png" failure with no fix. Return an actionable error
+  // instead. Models with UNKNOWN vision capability are never rejected here.
+  if (needs?.vision && candidates.length > 0) {
+    // Config-aware capability lookup: honors customProviders + plugins, not
+    // just the static catalog. UNKNOWN vision (no metadata at all) passes.
+    const anyVisionCapable = candidates.some(c => {
+      const info = resolveProvider(c.provider, cfg)?.models?.[c.model];
+      return info ? info.vision === true : true;
+    });
+    if (!anyVisionCapable) {
+      // Suggest a concrete vision-capable model from the usable providers
+      const suggestions = [];
+      for (const pid of available) {
+        const def = resolveProvider(pid, cfg);
+        for (const [mid, m] of Object.entries(def?.models || {})) {
+          if (m.vision === true) {
+            // some catalogs (nvidia, openrouter) already prefix model ids with the provider
+            const id = mid.startsWith(`${pid}/`) ? mid : `${pid}/${mid}`;
+            suggestions.push(id);
+            break;
+          }
+        }
+        if (suggestions.length >= 2) break;
+      }
+      const active = candidates[0];
+      const fix = suggestions.length > 0
+        ? `Switch to a vision-capable model: blitz use ${suggestions[0]}  (or add it as a fallback: blitz fallback add ${suggestions[0].split('/')[0]})`
+        : `No vision-capable model is configured for your providers — configure one that supports image input.`;
+      return {
+        candidates: [],
+        warnings,
+        source,
+        needs,
+        estTokens,
+        fatalError: `This request contains image input, but the selected model ${active.provider}/${active.model} does not support images. ${fix}`,
+      };
+    }
+  }
+
   // Order overflow-related fallbacks by context headroom (bigger windows first)
   if (estTokens > 0 && candidates.length > 1) {
     const stable = candidates.map((c, i) => ({ c, i }));

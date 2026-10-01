@@ -1,4 +1,4 @@
-![version](https://img.shields.io/badge/version-2.0.0-blue) ![node](https://img.shields.io/badge/node-18%2B-green) ![zero deps](https://img.shields.io/badge/dependencies-zero-brightgreen) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Mac%20%7C%20Linux-lightgrey) ![tests](https://img.shields.io/badge/tests-270%20passed%20%2F%2018%20suites-brightgreen) ![CI](https://github.com/jenil0528/blitz-proxy/actions/workflows/ci.yml/badge.svg)
+![version](https://img.shields.io/badge/version-2.0.0-blue) ![node](https://img.shields.io/badge/node-18%2B-green) ![zero deps](https://img.shields.io/badge/dependencies-zero-brightgreen) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Mac%20%7C%20Linux-lightgrey) ![tests](https://img.shields.io/badge/tests-282%20passed%20%2F%2019%20suites-brightgreen) ![CI](https://github.com/jenil0528/blitz-proxy/actions/workflows/ci.yml/badge.svg)
 
 # ⚡ BlitzProxy
 
@@ -257,6 +257,23 @@ blitz profile add mine --chain "nvidia,deepseek/deepseek-chat" --desc="my chain"
 blitz profile off
 ```
 
+## Sessions & Resume
+
+Agents own their own history — BLITZ only keeps lightweight **recovery metadata** (project, branch, agent, model, status, timestamps — never conversation content, never keys):
+
+```bash
+blitz sessions              # discovery: ACTIVE / INTERRUPTED / COMPLETED
+blitz session show <id>     # full metadata + Claude Code's native session id when found
+blitz resume                # pick a resumable session
+blitz resume 1              # resume it: relaunches in the project directory,
+                            #   using the agent's OWN resume mechanism when it has one
+blitz session cleanup       # remove expired recovery metadata (sessionRetentionDays, 0 = forever)
+```
+
+- **Interrupted detection**: a session whose agent process vanished without a clean exit is marked `INTERRUPTED` on the next `blitz sessions` run (crash, closed terminal, reboot).
+- **Native resume**: Claude Code resumes via its own `--continue`; agents without a reliably-detectable resume mechanism are honestly reported — "Native resume is unavailable" — never faked.
+- Privacy: local JSON in `~/.blitzproxy`, never uploaded anywhere (this project has no remote code at all).
+
 ## Provider Health
 
 ```bash
@@ -293,6 +310,18 @@ blitz context unlock                #   until you unlock
 - nothing is deleted: duplicates keep the first occurrence + count, so information is compressed, not lost — "critical content removed: 0" is a stat reported on every request
 
 **AGGRESSIVE** additionally collapses exact-duplicate whole output blocks in *old* messages (first copy kept, later copies marked) and narrows the recency window to 2; **BALANCED** sits between SAFE and AGGRESSIVE (block dedup, recency 4); **CUSTOM** gives per-operation switches. Semantic summarization is deliberately **not implemented** — it would require model calls and can hallucinate; noise removal doesn't.
+
+### Vision guard (no more confusing image errors)
+
+A request containing images is **never sent to a model that is known not to support image input** — that combination is what produced cryptic `Cannot read "image.png"` failures and garbled output. Instead you get an immediate, actionable error:
+
+```
+This request contains image input, but the selected model nvidia/z-ai/glm-5.3
+does not support images. Switch to a vision-capable model: blitz use <model>
+(or add it as a fallback: blitz fallback add <provider>)
+```
+
+Models with unknown vision capabilities are never rejected on a guess — only verified catalog metadata triggers the guard.
 
 Every optimized request is transparent: `X-Blitz-Context-Reduction` header (percent saved), a `CONTEXT` log line (original→optimized tokens, critical-removed count), and full reversibility — the optimizer is a pure function over a copy; if it ever fails, the request proceeds with the original context untouched.
 
@@ -408,7 +437,7 @@ blitz config set proxyPort 4818
 ## Development
 
 ```bash
-npm test            # 270 tests, 18 suites — mocked providers behind real HTTP servers, no real keys
+npm test            # 282 tests, 19 suites — mocked providers behind real HTTP servers, no real keys
 npm run lint        # syntax check over all sources
 npm run dev         # watch-mode server
 npm run test:live   # OPT-IN live tests — set BLITZ_LIVE_TESTS=1 first; uses your real provider
@@ -420,7 +449,7 @@ Live tests (Anthropic + OpenAI + Responses endpoints, streaming, tool calls, rea
 
 | Area | Commands |
 |---|---|
-| Run & agents | `blitz` · `blitz claude/opencode/codex/aider` · `blitz cline` (setup values) · `blitz run <cmd>` · `blitz shell` · `blitz start/stop/restart/status` |
+| Run & agents | `blitz` · `blitz claude/opencode/codex/aider` · `blitz cline` (setup values) · `blitz run <cmd>` · `blitz shell` · `blitz start/stop/restart/status` · `sessions` · `session show` · `resume` |
 | Credentials | `blitz add` · `credentials` · `switch` · `rm` · `validate` |
 | Models | `blitz model` · `models` · `models refresh` · `use <provider/model>` · `alias` |
 | Routing | `blitz provider` · `auto` · `fallback` · `profile` · `config set fallbackMode strict` · `config set contextOptimization safe` |

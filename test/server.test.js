@@ -410,6 +410,33 @@ await test('context optimization OFF: identical request passes through byte-iden
   assert.ok(sent.content.includes('npm WARN deprecated left-pad@1.3.0'));
 });
 
+await test('images sent to a vision-less model produce a clear 400 with a fix — not garbage', async () => {
+  try {
+    saveConfig({ provider: 'mockc', model: 'mock/model-c', fallbackChain: [], profile: '' });
+    // mock/model-c has vision:false in its metadata — the request carries an image
+    const req = JSON.stringify({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 50,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aGVsbG8=' } },
+          { type: 'text', text: 'what is this?' },
+        ],
+      }],
+    });
+    const res = await post('/v1/messages', req);
+    assert.equal(res.status, 400);
+    const data = await res.json();
+    assert.equal(data.error.type, 'invalid_request_error');
+    assert.ok(data.error.message.includes('does not support images'), 'actionable, names the problem');
+    assert.ok(data.error.message.includes('blitz use '), 'tells the user how to fix it');
+    assert.ok(/^BLZ-[A-F0-9]{6}$/.test(data.request_id || ''));
+  } finally {
+    saveConfig({ provider: 'mocka', model: 'mock/model-a', fallbackChain: ['mockb'], profile: '' });
+  }
+});
+
 await test('GET /v1/models includes discovered models for the active provider', async () => {
   try {
     saveConfig({ discoveredModels: { mocka: { models: [{ id: 'mock/discovered-x', lastSeen: 'now' }], fetchedAt: 'now' } } });

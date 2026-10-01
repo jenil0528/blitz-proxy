@@ -181,5 +181,36 @@ await test('ENABLED mode (default): fallback chain + capability switching still 
   assert.equal(plan.candidates[0].provider, 'groq', 'capability mismatch switches when fallback is enabled');
 });
 
+await test('VISION GUARD: images are never sent to a known vision-less model', async () => {
+  // Active model z-ai/glm-5.3 has vision:false in the catalog; no vision
+  // fallback exists → a clear actionable error, never silent garbage.
+  saveConfig({
+    routing: 'manual', profile: '', provider: 'nvidia',
+    model: 'z-ai/glm-5.3', fallbackChain: [], fallbackModels: {},
+  });
+  const plan = await planCandidates({ cfg: getConfig(), keyring, needs: { vision: true }, estTokens: 100 });
+  assert.equal(plan.candidates.length, 0);
+  assert.ok(plan.fatalError.includes('does not support images'), 'clear error naming the problem');
+  assert.ok(plan.fatalError.includes('nvidia/z-ai/glm-5.3'), 'names the model');
+  assert.ok(plan.fatalError.includes('blitz use '), 'actionable fix included');
+});
+
+await test('VISION GUARD: a vision-capable fallback makes the request succeed instead', async () => {
+  saveConfig({
+    routing: 'manual', profile: '', provider: 'nvidia',
+    model: 'z-ai/glm-5.3', fallbackChain: ['mock-provider-x'], fallbackModels: {},
+    customProviders: {
+      'mock-provider-x': {
+        name: 'VisionMock', baseUrl: 'http://127.0.0.1:1/v1', defaultModel: 'vision-model',
+        requiresKey: false,
+        models: { 'vision-model': { tools: true, vision: true, reasoning: false, tags: [] } },
+      },
+    },
+  });
+  const plan = await planCandidates({ cfg: getConfig(), keyring, needs: { vision: true }, estTokens: 100 });
+  assert.ok(plan.candidates.length >= 1, 'the vision-capable model is routed');
+  assert.equal(plan.fatalError, undefined);
+});
+
 console.log(`\n${passed + failed} tests — ${passed} passed, ${failed} failed\n`);
 if (failed > 0) process.exit(1);

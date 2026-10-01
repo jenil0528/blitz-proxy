@@ -56,6 +56,7 @@ export const DEFAULT_CONFIG = {
   contextOptimization: 'safe',  // 'off' | 'safe' | 'balanced' | 'aggressive' | 'custom'
   contextCustom: {},            // per-operation flags for custom mode
   contextLock: false,           // when true, only `blitz context unlock` allows mode changes
+  sessionRetentionDays: 30,     // recovery metadata retention; 0 = keep forever
   proxyPort: 4819,
   host: '127.0.0.1',             // local-first; never 0.0.0.0 by default
   requireAuth: false,            // token required for /v1/* (admin always requires it)

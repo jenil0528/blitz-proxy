@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased — sessions & resume + vision guard
+
+### Fixed — Vision guard (no more cryptic image errors)
+- Requests containing images are **never sent to models that are known (catalog/custom-provider metadata) not to support image input** — the combination that produced confusing `Cannot read "image.png"` failures and garbled output. Instead: an immediate, actionable `400` naming the model and the exact fix (`blitz use <vision-model>` or add a vision fallback). UNKNOWN capabilities never trigger the guard — only verified metadata does. Config-aware: honors customProviders/plugins, not just the static catalog.
+
+### Added — Session & resume system (recovery metadata only)
+- `src/sessions.js` — local session registry (never conversation content, never keys): agent, project, git branch, model, profile, status (`ACTIVE`/`COMPLETED`/`INTERRUPTED`/`FAILED`), timestamps. Abnormal termination (crash, closed terminal, reboot) is detected by process-liveness pruning.
+- `src/agents.js` — agent adapters: install detection, native-resume knowledge. Claude Code resumes via its own `--continue`; native session ids are discoverable for `blitz session show`. Codex/OpenCode/Aider honestly report "Native resume is unavailable" — never faked.
+- CLI: `blitz sessions`, `blitz session show <id>`, `blitz resume [n|id]` (relaunches in the project directory with the agent's native resume mechanism), `blitz session cleanup` (retention via `sessionRetentionDays`, 0 = forever).
+- Every `blitz run`/launcher session is tracked from spawn to exit.
+
+### Fixed — session registry robustness (found by tests)
+- `persist()` now creates the storage directory instead of silently no-oping.
+- `touch()` no longer overwrites an explicitly provided `lastActivity`.
+
+### Tests
+- 270 → **282 tests across 19 suites** — session lifecycle (create/exit/prune/cleanup/persistence/privacy), agent adapters (path encoding, native session discovery, honest resume), vision guard (router + end-to-end 400 with actionable message + vision-capable fallback routing).
+
 ## Unreleased — context control + token tracking + capability registry
 
 ### Added — Advanced context control
