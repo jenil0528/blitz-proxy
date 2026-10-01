@@ -26,6 +26,7 @@ import { withRetry } from './retry.js';
 import { resolveCredential, markCredentialRejected, markCredentialRateLimited, markCredentialHealthy } from './credentials.js';
 import { newDiscoveredIds } from './models-cache.js';
 import { optimizeContext } from './context-optimizer.js';
+import { normalizeUsage } from './usage.js';
 import { requestNeeds, requestNeedsOpenAI, estimateTokens } from './routing/capabilities.js';
 import { planCandidates, resolveActiveProvider } from './routing/router.js';
 import { classifyHttpError, classifyNetworkError } from './routing/fallback.js';
@@ -426,7 +427,7 @@ export function createProxyServer({ keyring, stats, token }) {
     let effectiveReq = anthropicReq;
     let ctxStats = null;
     try {
-      const optimized = optimizeContext(anthropicReq, { mode: cfg.contextOptimization });
+      const optimized = optimizeContext(anthropicReq, { mode: cfg.contextOptimization, custom: cfg.contextCustom });
       if (optimized.stats) {
         effectiveReq = { ...anthropicReq, messages: optimized.messages, system: optimized.system };
         ctxStats = optimized.stats;
@@ -446,6 +447,12 @@ export function createProxyServer({ keyring, stats, token }) {
     const plan = await planCandidates({ cfg, keyring, needs, estTokens, health });
 
     for (const w of plan.warnings) log.warn(`[Router] ${w}`);
+
+    // STRICT mode capability refusal: clear error, never a silent model switch.
+    if (plan.fatalError) {
+      sendAnthropicError(res, 400, 'invalid_request_error', plan.fatalError, requestId);
+      return;
+    }
 
     if (plan.candidates.length === 0) {
       sendAnthropicError(res, 503, 'api_error', 'No usable provider is configured. Add a key with: blitz add <api-key>', requestId);
@@ -543,7 +550,9 @@ export function createProxyServer({ keyring, stats, token }) {
             recordRequest(stats, {
               providerId: cand.provider, model: cand.model, ok: true, status: 200,
               latencyMs,
-              inputTokens: result.inputTokens, outputTokens: result.outputTokens,
+              inputTokens: result.inputTokens || estTokens, outputTokens: result.outputTokens,
+              estimated: !(result.inputTokens > 0), // no provider usage chunk → estimate, marked
+              contextSavedTokens: ctxStats?.tokensSaved || 0,
               fallbackTo: i > 0 ? plan.candidates[i - 1].provider : undefined,
             });
             appendLog(`[${logTimestamp()}] POST ${path} → 200 OK (${latencyMs}ms) ${cand.provider}/${cand.model} [stream] req=${requestId}`);
@@ -553,13 +562,18 @@ export function createProxyServer({ keyring, stats, token }) {
 
         const openaiRes = await response.json();
         response.__blitzTimers?.clear();
+        const usage = normalizeUsage({ openai: openaiRes?.usage, estimatedInputTokens: estTokens });
         const anthropicRes = translateResponse(openaiRes, toolIdMap, anthropicReq.model || cand.model);
         const latencyMs = Date.now() - started;
         recordRequest(stats, {
           providerId: cand.provider, model: cand.model, ok: true, status: 200,
           latencyMs,
-          inputTokens: anthropicRes.usage.input_tokens,
-          outputTokens: anthropicRes.usage.output_tokens,
+          inputTokens: usage?.inputTokens ?? anthropicRes.usage.input_tokens,
+          outputTokens: usage?.outputTokens ?? anthropicRes.usage.output_tokens,
+          cachedTokens: usage?.cachedInputTokens,
+          reasoningTokens: usage?.reasoningTokens,
+          estimated: usage?.estimated === true,
+          contextSavedTokens: ctxStats?.tokensSaved || 0,
           fallbackTo: i > 0 ? plan.candidates[i - 1].provider : undefined,
         });
         appendLog(`[${logTimestamp()}] POST ${path} → 200 OK (${Date.now() - reqStart}ms) ${cand.provider}/${cand.model} req=${requestId}`);
@@ -621,6 +635,12 @@ export function createProxyServer({ keyring, stats, token }) {
     const needs = requestNeedsOpenAI(body);
     const estTokens = estimateTokens(body);
     const plan = await planCandidates({ cfg, keyring, needs, estTokens, health });
+
+    if (plan.fatalError) {
+      // STRICT mode capability refusal: clear error, never a silent model switch.
+      respondOpenAIError(res, 400, 'invalid_request', plan.fatalError, requestId);
+      return;
+    }
 
     if (plan.candidates.length === 0) {
       respondOpenAIError(res, 503, 'api_error', 'No usable provider is configured', requestId);
@@ -711,15 +731,18 @@ export function createProxyServer({ keyring, stats, token }) {
 
         const text = await response.text();
         response.__blitzTimers?.clear();
-        let usage = null;
+        let normUsage = null;
         try {
           const parsed = JSON.parse(text);
-          usage = parsed?.usage || null;
+          normUsage = normalizeUsage({ openai: parsed?.usage, estimatedInputTokens: estTokens });
         } catch { /* passthrough — no usage available */ }
         recordRequest(stats, {
           providerId: cand.provider, model: cand.model, ok: true, status: 200,
           latencyMs: Date.now() - started,
-          inputTokens: usage?.prompt_tokens, outputTokens: usage?.completion_tokens,
+          inputTokens: normUsage?.inputTokens, outputTokens: normUsage?.outputTokens,
+          cachedTokens: normUsage?.cachedInputTokens,
+          reasoningTokens: normUsage?.reasoningTokens,
+          estimated: normUsage?.estimated === true,
           fallbackTo: i > 0 ? plan.candidates[i - 1].provider : undefined,
         });
         appendLog(`[${logTimestamp()}] POST ${path} → 200 OK (${Date.now() - reqStart}ms) ${cand.provider}/${cand.model} [openai] req=${requestId}`);
@@ -785,6 +808,12 @@ export function createProxyServer({ keyring, stats, token }) {
     };
     const estTokens = estimateTokens({ messages: openaiBody.messages, tools: openaiBody.tools });
     const plan = await planCandidates({ cfg, keyring, needs, estTokens, health });
+
+    if (plan.fatalError) {
+      // STRICT mode capability refusal: clear error, never a silent model switch.
+      respondOpenAIError(res, 400, 'invalid_request', plan.fatalError, requestId);
+      return;
+    }
 
     if (plan.candidates.length === 0) {
       respondOpenAIError(res, 503, 'api_error', 'No usable provider is configured', requestId);
@@ -859,7 +888,8 @@ export function createProxyServer({ keyring, stats, token }) {
             providerId: cand.provider, model: cand.model,
             ok: !result.errored, status: result.errored ? 502 : 200,
             latencyMs,
-            inputTokens: result.inputTokens, outputTokens: result.outputTokens,
+            inputTokens: result.inputTokens || estTokens, outputTokens: result.outputTokens,
+            estimated: !(result.inputTokens > 0), // no provider usage chunk → estimate, marked
             fallbackTo: i > 0 ? plan.candidates[i - 1].provider : undefined,
           });
           appendLog(`[${logTimestamp()}] POST ${path} → ${result.errored ? 'STREAM-ERROR' : '200 OK'} (${latencyMs}ms) ${cand.provider}/${cand.model} [responses|stream] req=${requestId}`);
@@ -868,12 +898,17 @@ export function createProxyServer({ keyring, stats, token }) {
 
         const openaiRes = await response.json();
         response.__blitzTimers?.clear();
+        const rUsage = normalizeUsage({ openai: openaiRes?.usage, estimatedInputTokens: estTokens });
         const out = translateResponsesResponse(openaiRes, responsesReq.model || cand.model);
         const latencyMs = Date.now() - started;
         recordRequest(stats, {
           providerId: cand.provider, model: cand.model, ok: true, status: 200,
           latencyMs,
-          inputTokens: out.usage.input_tokens, outputTokens: out.usage.output_tokens,
+          inputTokens: rUsage?.inputTokens ?? out.usage.input_tokens,
+          outputTokens: rUsage?.outputTokens ?? out.usage.output_tokens,
+          cachedTokens: rUsage?.cachedInputTokens,
+          reasoningTokens: rUsage?.reasoningTokens,
+          estimated: rUsage?.estimated === true,
           fallbackTo: i > 0 ? plan.candidates[i - 1].provider : undefined,
         });
         appendLog(`[${logTimestamp()}] POST ${path} → 200 OK (${Date.now() - reqStart}ms) ${cand.provider}/${cand.model} [responses] req=${requestId}`);

@@ -194,6 +194,7 @@ export async function planCandidates({ cfg, keyring, needs, estTokens, health })
   // (401/403). Ordering comes from the canonical credential resolver.
   let candidates = [];
   const skippedForCapability = [];
+  let fatalError = null;
   for (const c of deduped) {
     const def = resolveProvider(c.provider, cfg);
     if (!def) continue;
@@ -220,14 +221,16 @@ export async function planCandidates({ cfg, keyring, needs, estTokens, health })
 
     const sat = modelSatisfies(c.provider, model, needs || {}, estTokens || 0);
     if (!sat.ok) {
-      // STRICT mode: never silently replace an explicitly selected model with
-      // a "more capable" one — user intent outranks capability heuristics.
+      // STRICT mode: the explicit selection is authoritative. A KNOWN
+      // capability mismatch produces a clear client-visible error — never a
+      // silent switch to a "more capable" model.
       if (cfg.fallbackMode === 'strict' && c.model) {
-        warnings.push(`⚠ ${c.provider}/${c.model}: ${sat.reasons.join('; ')} — using anyway (strict mode: explicit selection wins)`);
-      } else {
-        skippedForCapability.push({ provider: c.provider, model, reasons: sat.reasons, creds: providerCreds });
-        continue;
+        fatalError = `Capability mismatch on the explicitly selected model ${c.provider}/${c.model}: ${sat.reasons.join('; ')}. Strict mode does not switch models — fix the request or choose a capable model.`;
+        warnings.push(`✗ ${c.provider}/${c.model}: ${sat.reasons.join('; ')} — strict mode: refusing (explicit selection locked)`);
+        break;
       }
+      skippedForCapability.push({ provider: c.provider, model, reasons: sat.reasons, creds: providerCreds });
+      continue;
     } else {
       for (const r of sat.reasons || []) warnings.push(`${c.provider}: ${r}`);
     }
@@ -264,6 +267,11 @@ export async function planCandidates({ cfg, keyring, needs, estTokens, health })
         });
       }
     }
+  }
+
+  // STRICT mode refused to route: no candidates, a clear client-visible error.
+  if (fatalError) {
+    return { candidates: [], warnings, source, needs, estTokens, fatalError };
   }
 
   // Order overflow-related fallbacks by context headroom (bigger windows first)

@@ -53,7 +53,9 @@ export const DEFAULT_CONFIG = {
   fallbackModels: {},            // { providerId: modelId } per-fallback model
   fallbackOnAuthError: false,    // auth failures do NOT failover by default
   fallbackMode: 'enabled',       // 'enabled' | 'strict' — strict: explicit model fails → error, never a silent switch
-  contextOptimization: 'safe',  // 'off' | 'safe' | 'aggressive' — context optimizer mode
+  contextOptimization: 'safe',  // 'off' | 'safe' | 'balanced' | 'aggressive' | 'custom'
+  contextCustom: {},            // per-operation flags for custom mode
+  contextLock: false,           // when true, only `blitz context unlock` allows mode changes
   proxyPort: 4819,
   host: '127.0.0.1',             // local-first; never 0.0.0.0 by default
   requireAuth: false,            // token required for /v1/* (admin always requires it)

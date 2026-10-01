@@ -24,6 +24,8 @@ import { resolveCredential, resolveCredentials } from './src/credentials.js';
 import { validateConfig, formatValidation } from './src/config-validate.js';
 import { mergeDiscovered, discoveredList } from './src/models-cache.js';
 import { resolveAlias, listAliases, validateAliasValue, ALIAS_RE } from './src/aliases.js';
+import { CONTEXT_MODES } from './src/context-optimizer.js';
+import { getCapabilities, capabilityMark, capabilityLabel, formatTokens } from './src/model-capabilities.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const HOME = process.env.BLITZ_HOME || join(homedir(), '.blitzproxy');
@@ -87,6 +89,8 @@ async function main() {
     case 'roo':
     case 'roocode':        return cmdEditorAgentHelp();
     case 'compatibility':  return await cmdCompatibility();
+    case 'context':         return cmdContext(args);
+    case 'usage':           return await cmdUsage(args);
 
     // ── Routing ──
     case 'profile':
@@ -308,6 +312,155 @@ async function cmdStatus() {
   console.log(`    Credentials:  ${keys.length} in ${globalThis.__blitzMode} keyring${keys.some(k => k.provider === active.providerId && k.id !== activeCred?.id) ? '  •  rotation ready' : ''}`);
   console.log(`    Models:       ${modelCount}${Object.keys(cfg.aliases || {}).length ? `  •  aliases: ${Object.keys(cfg.aliases).join(', ')}` : ''}`);
   console.log(`    Privacy:      ${cfg.privacy ? `${C.grn}ON${C.r}` : 'off'}  •  Config: ${CONFIG_PATH}\n`);
+}
+
+// ─── Context control ─────────────────────────────────────────────────────────
+
+const CUSTOM_OPS = ['ansi', 'overwrites', 'duplicates', 'blankWalls', 'blockDedup', 'nonConsecutive', 'recency'];
+
+function cmdContext(args) {
+  const cfg = getConfig();
+  const sub = (args[0] || 'status').toLowerCase();
+
+  if (sub === 'status') {
+    console.log(`\n${C.b}Context Optimization${C.r}\n`);
+    console.log(`  Mode:            ${C.b}${cfg.contextOptimization || 'safe'}${C.r}${cfg.contextLock ? '  •  🔒 LOCKED' : ''}`);
+    if (cfg.contextOptimization === 'custom') {
+      const merged = contextModeOptions(cfg);
+      console.log(`  Custom flags:    ${CUSTOM_OPS.map(op => `${op}=${merged[op]}`).join('  ')}`);
+    } else {
+      console.log(`  Guarantee:        system + user text and the recency window are never touched`);
+      console.log(`                   nothing is deleted — duplicates keep the first copy + count`);
+    }
+    console.log(`  Change:          blitz context <off|safe|balanced|aggressive|custom>`);
+    if (!cfg.contextLock) console.log(`  Lock:             blitz context lock   ${C.d}(prevents any mode change until unlocked)${C.r}`);
+    else console.log(`  ${C.yel}🔒 Locked — run: blitz context unlock${C.r}`);
+    console.log();
+    return;
+  }
+  if (sub === 'lock' || sub === 'unlock') {
+    const next = sub === 'lock';
+    saveConfig({ contextLock: next });
+    console.log(next ? `${C.grn}🔒 Context policy locked${C.r} ${C.d}— the mode cannot change until: blitz context unlock${C.r}`
+                    : `${C.grn}Context policy unlocked${C.r}`);
+    return;
+  }
+  if (sub === 'custom') {
+    const op = args[1];
+    const value = args[2];
+    if (!op || !CUSTOM_OPS.includes(op)) {
+      console.log(`${C.red}✕ Usage: blitz context custom <${CUSTOM_OPS.join('|')}> <on|off|recency-number>${C.r}`);
+      process.exit(1);
+    }
+    const merged = { ...(cfg.contextCustom || {}) };
+    if (op === 'recency') {
+      const n = parseInt(value, 10);
+      if (isNaN(n) || n < 0 || n > 100) {
+        console.log(`${C.red}✕ recency must be a number of trailing messages (0-100)${C.r}`);
+        process.exit(1);
+      }
+      merged.recency = n;
+    } else {
+      if (value !== 'on' && value !== 'off') {
+        console.log(`${C.red}✕ Value must be on|off${C.r}`);
+        process.exit(1);
+      }
+      merged[op] = value === 'on';
+    }
+    saveConfig({ contextCustom: merged, contextOptimization: 'custom' });
+    console.log(`${C.grn}✓ custom.${op} set — context mode is now CUSTOM${C.r}`);
+    return;
+  }
+  if (CONTEXT_MODES.includes(sub)) {
+    if (cfg.contextLock) {
+      console.log(`${C.red}✕ Context policy is LOCKED — unlock first: blitz context unlock${C.r}`);
+      process.exit(1);
+    }
+    saveConfig({ contextOptimization: sub });
+    console.log(`${C.grn}✓ Context mode: ${C.b}${sub}${C.r}`);
+    if (sub === 'off') console.log(`${C.d}  Original context is sent unchanged (upstream limits still apply).${C.r}`);
+    if (sub === 'safe') console.log(`${C.d}  Lossless noise removal only — instructions, errors, tool calls, recency: never touched.${C.r}`);
+    if (sub === 'balanced') console.log(`${C.d}  SAFE + duplicate old output blocks collapse (first copy + marker kept).${C.r}`);
+    if (sub === 'aggressive') console.log(`${C.d}  BALANCED + non-consecutive duplicate collapse, recency window 2.${C.r}`);
+    if (sub === 'custom') console.log(`${C.d}  Per-operation control: blitz context custom <op> <on|off>${C.r}`);
+    return;
+  }
+  console.log(`${C.d}Usage: blitz context [off|safe|balanced|aggressive|custom|status|lock|unlock|custom <op> <on|off>]${C.r}`);
+}
+
+function contextModeOptions(cfg) {
+  const safe = { ansi: true, overwrites: true, duplicates: true, blankWalls: true, blockDedup: false, nonConsecutive: false, recency: 6 };
+  return cfg.contextOptimization === 'custom' ? { ...safe, ...(cfg.contextCustom || {}) } : safe;
+}
+
+// ─── Usage reporting (normalized token accounting) ───────────────────────────
+
+async function cmdUsage(args) {
+  const cfg = getConfig();
+  let scope = 'today';
+  let filter = null;   // { kind: 'model'|'provider', value }
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]?.toLowerCase();
+    if (a === 'today') scope = 'today';
+    else if (a === 'month') scope = 'month';
+    else if (a === 'all') scope = 'all';
+    else if (a === 'model' || a === 'provider') {
+      filter = { kind: a, value: args[i + 1] };
+      i++;
+    }
+  }
+
+  const stats = createStats({ home: HOME, privacy: cfg.privacy === true });
+  const { providers, models } = stats.getUsage({ scope });
+  const label = scope === 'today' ? 'Today' : scope === 'month' ? 'This month' : 'All time';
+
+  const rows = filter?.kind === 'provider'
+    ? providers.filter(r => r.providerId === filter.value)
+    : providers;
+
+  const tot = rows.reduce((acc, r) => ({
+    requests: acc.requests + r.requests,
+    ok: acc.ok + r.ok,
+    fail: acc.fail + r.fail,
+    input: acc.input + (r.inputTokens || 0),
+    output: acc.output + (r.outputTokens || 0),
+    cached: acc.cached + (r.cachedTokens || 0),
+    reasoning: acc.reasoning + (r.reasoningTokens || 0),
+    ctxSaved: acc.ctxSaved + (r.contextSavedTokens || 0),
+    estimated: acc.estimated + (r.estimatedRequests || 0),
+  }), { requests: 0, ok: 0, fail: 0, input: 0, output: 0, cached: 0, reasoning: 0, ctxSaved: 0, estimated: 0 });
+
+  console.log(`\n${C.b}BLITZ USAGE${C.r}  ${C.d}— ${label}${C.r}\n`);
+  if (tot.requests === 0) {
+    console.log(`${C.d}No recorded requests in this period.${C.r}\n`);
+    return;
+  }
+  console.log(`  Requests:       ${tot.requests}  ${C.d}(${tot.ok} ok, ${tot.fail} failed)${C.r}`);
+  console.log(`  Input:          ${fmtTok(tot.input)}`);
+  console.log(`  Output:         ${fmtTok(tot.output)}`);
+  if (tot.cached) console.log(`  Cached input:   ${fmtTok(tot.cached)}  ${C.d}(cache reads + writes)${C.r}`);
+  if (tot.reasoning) console.log(`  Reasoning:      ${fmtTok(tot.reasoning)}`);
+  console.log(`  Total:          ${fmtTok(tot.input + tot.output + tot.cached)}`);
+  if (tot.ctxSaved) console.log(`  Context saved:  ${fmtTok(tot.ctxSaved)}  ${C.grn}— optimizer savings${C.r}`);
+  const exactPct = tot.requests > 0 ? Math.round(((tot.requests - tot.estimated) / tot.requests) * 100) : 0;
+  console.log(`  Usage source:   ${C.b}${exactPct}% EXACT${C.r}${tot.estimated ? ` ${C.d}+ ${tot.estimated} ESTIMATED (provider returned no usage)${C.r}` : ''}`);
+
+  const modelRows = (filter?.kind === 'model' ? models.filter(m => m.model === filter.value) : models).slice(0, 8);
+  if (modelRows.length > 0) {
+    console.log(`\n  ${C.b}By model${C.r}`);
+    for (const m of modelRows) {
+      const total = (m.inputTokens || 0) + (m.outputTokens || 0);
+      console.log(`    ${(m.model || '—').padEnd(42).slice(0, 42)} ${fmtTok(total).padStart(8)}  ${C.d}${m.requests} req${C.r}`);
+    }
+  }
+  console.log();
+}
+
+function fmtTok(n) {
+  if (typeof n !== 'number' || isNaN(n)) return '0';
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return String(n);
 }
 
 // ─── Agent support: editors + compatibility tester ──────────────────────────
@@ -812,12 +965,119 @@ async function pickModel(def, modelIds) {
   return modelIds[idx];
 }
 
+function cmdModelCapabilities(modelQuery) {
+  const cfg = getConfig();
+  if (!modelQuery) {
+    console.log(`${C.red}✕ Usage: blitz model capabilities <provider/model | model>${C.r}`);
+    console.log(`${C.d}  Example: blitz model capabilities nvidia/z-ai/glm-5.3${C.r}`);
+    process.exit(1);
+  }
+  // Resolve provider/model — same disambiguation as `blitz use`
+  let providerId = cfg.provider;
+  let modelId = modelQuery;
+  const slashIdx = modelQuery.indexOf('/');
+  if (slashIdx > 0) {
+    const candidateProvider = modelQuery.slice(0, slashIdx);
+    if (allProviderIds(cfg).includes(candidateProvider)) {
+      providerId = candidateProvider;
+      modelId = modelQuery.slice(slashIdx + 1);
+      if (!findModelInfo(providerId, modelId) && findModelInfo(providerId, `${providerId}/${modelId}`)) {
+        modelId = `${providerId}/${modelId}`;
+      }
+    }
+  }
+  const caps = getCapabilities(providerId, modelId, cfg);
+  if (!caps) {
+    console.log(`${C.red}✕ Unknown provider: ${providerId}${C.r}`);
+    process.exit(1);
+  }
+  const def = resolveProvider(providerId, cfg);
+  console.log(`\n${C.b}${modelId}${C.r} ${C.d}(${def?.name || providerId})${C.r}\n`);
+  const row = (label, v) => console.log(`  ${label.padEnd(16)} ${v === true ? `${C.grn}✓${C.r}` : v === false ? `${C.red}✗${C.r}` : `${C.yel}?${C.r} ${C.d}UNKNOWN${C.r}`}`);
+  row('Streaming', caps.streaming);
+  row('Tools', caps.tools);
+  row('Structured', caps.structuredOutput);
+  row('JSON mode', caps.jsonMode);
+  row('Vision', caps.vision);
+  row('Reasoning', caps.reasoning);
+  row('Prompt caching', caps.promptCaching);
+  row('Embeddings', caps.embeddings);
+  console.log(`  ${'Context'.padEnd(16)} ${C.b}${formatTokens(caps.contextWindow)}${C.r}`);
+  console.log(`  ${'Max output'.padEnd(16)} ${C.b}${formatTokens(caps.maxOutputTokens)}${C.r}`);
+  console.log(`  ${'Protocol'.padEnd(16)} ${C.d}${caps.protocol}${C.r}`);
+  if (!caps.known) {
+    console.log(`\n  ${C.yel}?  This model is not in the verified catalog — capability values are UNKNOWN,${C.r}`);
+    console.log(`  ${C.d}   never assumed supported. Add catalog metadata or discover it: blitz models refresh${C.r}`);
+  }
+  console.log();
+}
+
+async function cmdModelTest(modelQuery) {
+  const cfg = getConfig();
+  const active = await resolveActiveProvider(cfg, keyring);
+  if (!modelQuery) {
+    console.log(`${C.d}No model given — testing the active model (${active.model || 'default'}).${C.r}`);
+  }
+  let providerId = active.providerId;
+  let modelId = modelQuery || active.model;
+  if (modelQuery) {
+    const slashIdx = modelQuery.indexOf('/');
+    if (slashIdx > 0) {
+      const candidateProvider = modelQuery.slice(0, slashIdx);
+      if (allProviderIds(cfg).includes(candidateProvider)) {
+        providerId = candidateProvider;
+        modelId = modelQuery.slice(slashIdx + 1);
+        if (!findModelInfo(providerId, modelId) && findModelInfo(providerId, `${providerId}/${modelId}`)) {
+          modelId = `${providerId}/${modelId}`;
+        }
+      }
+    }
+  }
+  const def = resolveProvider(providerId, cfg);
+  if (!def || !def.baseUrl) {
+    console.log(`${C.red}✕ Unknown or unconfigured provider: ${providerId}${C.r}`);
+    process.exit(1);
+  }
+  const cred = await resolveCredential({ keyring, providerId });
+  if (def.requiresKey !== false && !cred) {
+    console.log(`${C.red}✕ No credential stored for ${providerId} — blitz add <key> --provider=${providerId}${C.r}`);
+    process.exit(1);
+  }
+  console.log(`${C.d}Testing ${providerId}/${modelId} with a real 1-token request (uses your credential, never prints it)…${C.r}`);
+  const adapter = getAdapter(def);
+  const started = Date.now();
+  try {
+    const res = await adapter.chat({
+      def, key: cred?.key || '',
+      body: { model: modelId, messages: [{ role: 'user', content: 'Say "OK" in one word.' }], max_tokens: 5, stream: false },
+      timeoutMs: Math.min(def.timeout || 120000, 180000),
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      console.log(`${C.red}✕ HTTP ${res.status}: ${text.slice(0, 200)}${C.r}`);
+      process.exit(1);
+    }
+    let reply = '';
+    try { reply = JSON.parse(text).choices?.[0]?.message?.content || 'OK'; } catch { reply = 'OK'; }
+    console.log(`${C.grn}✓ ${providerId}/${modelId} responded${C.r} ${C.d}${Date.now() - started}ms — "${String(reply).trim().slice(0, 40)}"${C.r}`);
+  } catch (err) {
+    console.log(`${C.red}✕ ${err.message}${C.r}`);
+    process.exit(1);
+  }
+}
+
 async function cmdModel(args) {
   const cfg = getConfig();
   const active = await resolveActiveProvider(cfg, keyring);
   const def = resolveProvider(active.providerId, cfg) || getProvider('custom');
   const modelIds = Object.keys(def?.models || {});
   const live = args.includes('--live');
+
+  // ── subcommands first ──
+  const sub = (args[0] || '').toLowerCase();
+  if (sub === 'list') return await cmdModels([]);
+  if (sub === 'capabilities' || sub === 'caps') return cmdModelCapabilities(args.slice(1).join(' '));
+  if (sub === 'test') return await cmdModelTest(args.slice(1).join(' '));
 
   if (live && def.baseUrl) {
     try {

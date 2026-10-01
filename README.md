@@ -1,4 +1,4 @@
-![version](https://img.shields.io/badge/version-2.0.0-blue) ![node](https://img.shields.io/badge/node-18%2B-green) ![zero deps](https://img.shields.io/badge/dependencies-zero-brightgreen) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Mac%20%7C%20Linux-lightgrey) ![tests](https://img.shields.io/badge/tests-253%20passed%20%2F%2017%20suites-brightgreen) ![CI](https://github.com/jenil0528/blitz-proxy/actions/workflows/ci.yml/badge.svg)
+![version](https://img.shields.io/badge/version-2.0.0-blue) ![node](https://img.shields.io/badge/node-18%2B-green) ![zero deps](https://img.shields.io/badge/dependencies-zero-brightgreen) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Mac%20%7C%20Linux-lightgrey) ![tests](https://img.shields.io/badge/tests-270%20passed%20%2F%2018%20suites-brightgreen) ![CI](https://github.com/jenil0528/blitz-proxy/actions/workflows/ci.yml/badge.svg)
 
 # ⚡ BlitzProxy
 
@@ -142,6 +142,8 @@ blitz model glm            # fuzzy match (picks from matches, or prompts when am
 blitz model 7              # set by list number
 blitz model nvidia/meta/llama-3.3-70b-instruct   # provider/model syntax (switches provider)
 blitz model --live         # fetch the provider's real model list — selectable too
+blitz model capabilities nvidia/z-ai/glm-5.3    # normalized capabilities: ✓ / ✗ / ? UNKNOWN
+blitz model test nvidia/z-ai/glm-5.3             # real 1-token request against that model
 ```
 
 ### Model registry, discovery & aliases
@@ -270,9 +272,15 @@ Health has two layers:
 Coding agents shovel enormous terminal output — build logs, `npm install` walls, directory listings — into your context. The optimizer removes that noise **without ever deleting information**, on the `/v1/messages` path:
 
 ```bash
-blitz config set contextOptimization safe        # default
-blitz config set contextOptimization aggressive
-blitz config set contextOptimization off
+blitz context status                # current mode, guarantees, lock state
+blitz context safe                  # default: lossless noise removal only
+blitz context balanced              # + duplicate old output blocks collapse
+blitz context aggressive            # + non-consecutive duplicates, recency 2
+blitz context custom                # per-operation control:
+blitz context custom blockDedup on  #   ansi | overwrites | duplicates | blankWalls |
+blitz context custom recency 8      #   blockDedup | nonConsecutive | recency
+blitz context lock                  # freeze the policy — nothing can change it
+blitz context unlock                #   until you unlock
 ```
 
 **What it does (SAFE, the default):** strips ANSI escape codes (terminal formatting, not content), keeps only the final state of carriage-return progress lines, collapses runs of identical lines to the first occurrence plus an explicit `[+N duplicate lines collapsed]` marker, and collapses blank-line walls.
@@ -284,7 +292,7 @@ blitz config set contextOptimization off
 - `tool_use`, `thinking`, and image blocks are never modified
 - nothing is deleted: duplicates keep the first occurrence + count, so information is compressed, not lost — "critical content removed: 0" is a stat reported on every request
 
-**AGGRESSIVE** additionally collapses exact-duplicate whole output blocks in *old* messages (first copy kept, later copies marked) and narrows the recency window to 2. Semantic summarization is deliberately **not implemented** — it would require model calls and can hallucinate; noise removal doesn't.
+**AGGRESSIVE** additionally collapses exact-duplicate whole output blocks in *old* messages (first copy kept, later copies marked) and narrows the recency window to 2; **BALANCED** sits between SAFE and AGGRESSIVE (block dedup, recency 4); **CUSTOM** gives per-operation switches. Semantic summarization is deliberately **not implemented** — it would require model calls and can hallucinate; noise removal doesn't.
 
 Every optimized request is transparent: `X-Blitz-Context-Reduction` header (percent saved), a `CONTEXT` log line (original→optimized tokens, critical-removed count), and full reversibility — the optimizer is a pure function over a copy; if it ever fails, the request proceeds with the original context untouched.
 
@@ -293,7 +301,12 @@ Every optimized request is transparent: `X-Blitz-Context-Reduction` header (perc
 ```bash
 blitz dashboard    # → http://127.0.0.1:4819/dashboard?token=<your token>
 blitz stats        # per-provider request counts, success/fail, latency, tokens, estimated cost
+blitz usage        # normalized token accounting: input/output/cached/reasoning/context-saved,
+blitz usage month  #   EXACT vs ESTIMATED clearly separated, per-model breakdown
 blitz logs --live  # tail the request log (routes, statuses, latency — never prompts)
+```
+
+Providers do not return identical usage fields — BLITZ normalizes everything into one internal format (`src/usage.js`) and **estimates are always labeled ESTIMATED**, never presented as exact provider usage. Optimizer savings are tracked as `context saved` tokens.
 ```
 
 The dashboard is local-only, token-gated, and built with zero frontend dependencies: provider health, current routing, request counts, errors, fallback and rotation events, and clearly-labeled **pricing estimates** (unknown pricing shows `n/a` — never invented). Stats are aggregates only: prompts and responses are never stored.
@@ -395,7 +408,7 @@ blitz config set proxyPort 4818
 ## Development
 
 ```bash
-npm test            # 253 tests, 17 suites — mocked providers behind real HTTP servers, no real keys
+npm test            # 270 tests, 18 suites — mocked providers behind real HTTP servers, no real keys
 npm run lint        # syntax check over all sources
 npm run dev         # watch-mode server
 npm run test:live   # OPT-IN live tests — set BLITZ_LIVE_TESTS=1 first; uses your real provider
@@ -411,7 +424,7 @@ Live tests (Anthropic + OpenAI + Responses endpoints, streaming, tool calls, rea
 | Credentials | `blitz add` · `credentials` · `switch` · `rm` · `validate` |
 | Models | `blitz model` · `models` · `models refresh` · `use <provider/model>` · `alias` |
 | Routing | `blitz provider` · `auto` · `fallback` · `profile` · `config set fallbackMode strict` · `config set contextOptimization safe` |
-| Insight & safety | `blitz health` · `stats` · `logs` · `dashboard` · `doctor` · `config validate` · `compatibility` · `config` · `privacy` · `token` |
+| Insight & safety | `blitz health` · `stats` · `usage` · `logs` · `dashboard` · `doctor` · `config validate` · `compatibility` · `context` · `config` · `privacy` · `token` |
 
 ## License
 

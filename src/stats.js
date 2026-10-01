@@ -52,11 +52,25 @@ export function createStats({ home, privacy = false }) {
     const b = day[providerId] || {
       requests: 0, ok: 0, fail: 0, rateLimited: 0, fallbacks: 0,
       inputTokens: 0, outputTokens: 0,
+      cachedTokens: 0, reasoningTokens: 0, contextSavedTokens: 0, estimatedRequests: 0,
+      models: {},
       latencyMsSum: 0, latencyCount: 0,
       costUsd: 0, costCount: 0,
     };
     day[providerId] = b;
     return b;
+  }
+
+  function modelBucket(b, model) {
+    if (!model) return null;
+    const m = b.models[model] || {
+      requests: 0, ok: 0, fail: 0,
+      inputTokens: 0, outputTokens: 0,
+      cachedTokens: 0, reasoningTokens: 0, contextSavedTokens: 0, estimatedRequests: 0,
+      latencyMsSum: 0, latencyCount: 0,
+    };
+    b.models[model] = m;
+    return m;
   }
 
   function record(providerId, evt) {
@@ -70,7 +84,30 @@ export function createStats({ home, privacy = false }) {
     }
     if (evt.inputTokens) b.inputTokens += evt.inputTokens;
     if (evt.outputTokens) b.outputTokens += evt.outputTokens;
+    if (evt.cachedTokens) b.cachedTokens = (b.cachedTokens || 0) + evt.cachedTokens;
+    if (evt.reasoningTokens) b.reasoningTokens = (b.reasoningTokens || 0) + evt.reasoningTokens;
+    if (evt.contextSavedTokens) b.contextSavedTokens = (b.contextSavedTokens || 0) + evt.contextSavedTokens;
+    if (evt.estimated) b.estimatedRequests = (b.estimatedRequests || 0) + 1;
     if (evt.fallbackTo) b.fallbacks += 1;
+
+    // Per-model bucket (aggregates by model within the provider)
+    if (evt.model) {
+      const m = modelBucket(b, evt.model);
+      if (m) {
+        m.requests += 1;
+        if (evt.ok) m.ok += 1; else m.fail += 1;
+        if (evt.inputTokens) m.inputTokens += evt.inputTokens;
+        if (evt.outputTokens) m.outputTokens += evt.outputTokens;
+        if (evt.cachedTokens) m.cachedTokens = (m.cachedTokens || 0) + evt.cachedTokens;
+        if (evt.reasoningTokens) m.reasoningTokens = (m.reasoningTokens || 0) + evt.reasoningTokens;
+        if (evt.contextSavedTokens) m.contextSavedTokens = (m.contextSavedTokens || 0) + evt.contextSavedTokens;
+        if (evt.estimated) m.estimatedRequests = (m.estimatedRequests || 0) + 1;
+        if (typeof evt.latencyMs === 'number' && evt.latencyMs >= 0) {
+          m.latencyMsSum += evt.latencyMs;
+          m.latencyCount += 1;
+        }
+      }
+    }
     // A computed $0 estimate is valid (free tier) and must not be confused
     // with "pricing unknown" — tracked via costCount.
     if (typeof evt.costUsd === 'number') {
@@ -104,15 +141,20 @@ export function createStats({ home, privacy = false }) {
 
   function summarize(days) {
     const out = new Map();
+    const monthPrefix = todayKey().slice(0, 7); // YYYY-MM
     const dayKeys = days === 'all'
       ? Object.keys(data.days)
-      : [todayKey()];
+      : days === 'month'
+        ? Object.keys(data.days).filter(k => k.startsWith(monthPrefix))
+        : [todayKey()];
     for (const dayKey of dayKeys) {
       const day = data.days[dayKey] || {};
       for (const [providerId, b] of Object.entries(day)) {
         const agg = out.get(providerId) || {
           requests: 0, ok: 0, fail: 0, rateLimited: 0, fallbacks: 0,
           inputTokens: 0, outputTokens: 0,
+          cachedTokens: 0, reasoningTokens: 0, contextSavedTokens: 0, estimatedRequests: 0,
+          models: {},
           latencyMsSum: 0, latencyCount: 0, costUsd: 0, costCount: 0,
         };
         agg.requests += b.requests || 0;
@@ -122,10 +164,34 @@ export function createStats({ home, privacy = false }) {
         agg.fallbacks += b.fallbacks || 0;
         agg.inputTokens += b.inputTokens || 0;
         agg.outputTokens += b.outputTokens || 0;
+        agg.cachedTokens += b.cachedTokens || 0;
+        agg.reasoningTokens += b.reasoningTokens || 0;
+        agg.contextSavedTokens += b.contextSavedTokens || 0;
+        agg.estimatedRequests += b.estimatedRequests || 0;
         agg.latencyMsSum += b.latencyMsSum || 0;
         agg.latencyCount += b.latencyCount || 0;
         agg.costUsd += b.costUsd || 0;
         agg.costCount += b.costCount || 0;
+        // merge per-model buckets across days
+        for (const [model, m] of Object.entries(b.models || {})) {
+          const mm = agg.models[model] || (agg.models[model] = {
+            requests: 0, ok: 0, fail: 0,
+            inputTokens: 0, outputTokens: 0,
+            cachedTokens: 0, reasoningTokens: 0, contextSavedTokens: 0, estimatedRequests: 0,
+            latencyMsSum: 0, latencyCount: 0,
+          });
+          mm.requests += m.requests || 0;
+          mm.ok += m.ok || 0;
+          mm.fail += m.fail || 0;
+          mm.inputTokens += m.inputTokens || 0;
+          mm.outputTokens += m.outputTokens || 0;
+          mm.cachedTokens += m.cachedTokens || 0;
+          mm.reasoningTokens += m.reasoningTokens || 0;
+          mm.contextSavedTokens += m.contextSavedTokens || 0;
+          mm.estimatedRequests += m.estimatedRequests || 0;
+          mm.latencyMsSum += m.latencyMsSum || 0;
+          mm.latencyCount += m.latencyCount || 0;
+        }
         out.set(providerId, agg);
       }
     }
@@ -134,10 +200,21 @@ export function createStats({ home, privacy = false }) {
 
   /**
    * Summary for display: today (default) or all retained days.
+   * Returns the provider rows array (backward-compatible shape).
    */
   function getSummary({ scope = 'today' } = {}) {
-    const providers = summarize(scope === 'all' ? 'all' : 1);
+    return getUsage({ scope }).providers;
+  }
+
+  /**
+   * Rich usage summary: provider rows + per-model rows (model across providers).
+   * New token dimensions: cachedTokens, reasoningTokens, contextSavedTokens,
+   * estimatedRequests (estimates never counted as exact).
+   */
+  function getUsage({ scope = 'today' } = {}) {
+    const providers = summarize(scope === 'all' ? 'all' : scope === 'month' ? 'month' : 1);
     const rows = [];
+    const models = new Map();
     for (const [providerId, b] of providers) {
       rows.push({
         providerId,
@@ -148,12 +225,36 @@ export function createStats({ home, privacy = false }) {
         fallbacks: b.fallbacks,
         inputTokens: b.inputTokens,
         outputTokens: b.outputTokens,
+        cachedTokens: b.cachedTokens,
+        reasoningTokens: b.reasoningTokens,
+        contextSavedTokens: b.contextSavedTokens,
+        estimatedRequests: b.estimatedRequests,
         avgLatencyMs: b.latencyCount > 0 ? Math.round(b.latencyMsSum / b.latencyCount) : null,
         costUsd: b.costCount > 0 ? b.costUsd : null, // estimate; null = pricing unknown
       });
+      for (const [model, m] of Object.entries(b.models || {})) {
+        let mm = models.get(model);
+        if (!mm) {
+          mm = {
+            model, requests: 0, ok: 0, fail: 0,
+            inputTokens: 0, outputTokens: 0,
+            cachedTokens: 0, reasoningTokens: 0, contextSavedTokens: 0, estimatedRequests: 0,
+          };
+          models.set(model, mm);
+        }
+        mm.requests += m.requests;
+        mm.ok += m.ok;
+        mm.fail += m.fail;
+        mm.inputTokens += m.inputTokens;
+        mm.outputTokens += m.outputTokens;
+        mm.cachedTokens += m.cachedTokens;
+        mm.reasoningTokens += m.reasoningTokens;
+        mm.contextSavedTokens += m.contextSavedTokens;
+        mm.estimatedRequests += m.estimatedRequests;
+      }
     }
     rows.sort((a, b2) => b2.requests - a.requests);
-    return rows;
+    return { providers: rows, models: [...models.values()].sort((a, b2) => b2.requests - a.requests) };
   }
 
   function clear() {
@@ -162,20 +263,27 @@ export function createStats({ home, privacy = false }) {
     flush();
   }
 
-  return { record, flush, getSummary, clear, filePath, isPrivacy: () => privacy };
+  return { record, flush, getSummary, getUsage, clear, filePath, isPrivacy: () => privacy };
 }
 
 /**
  * Convenience: record a completed request with cost estimate.
+ * New optional fields flow through to the new token dimensions:
+ * cachedTokens, reasoningTokens, estimated, contextSavedTokens.
  */
-export function recordRequest(stats, { providerId, model, ok, status, latencyMs, inputTokens, outputTokens, rateLimited, fallbackTo }) {
+export function recordRequest(stats, { providerId, model, ok, status, latencyMs, inputTokens, outputTokens, cachedTokens, reasoningTokens, estimated, contextSavedTokens, rateLimited, fallbackTo }) {
   const cost = ok ? estimateRequestCost(providerId, model, inputTokens || 0, outputTokens || 0) : null;
   stats.record(providerId, {
     ok,
+    model,
     rateLimited: rateLimited === true,
     latencyMs,
     inputTokens: inputTokens || 0,
     outputTokens: outputTokens || 0,
+    cachedTokens: cachedTokens || 0,
+    reasoningTokens: reasoningTokens || 0,
+    estimated: estimated === true,
+    contextSavedTokens: contextSavedTokens || 0,
     fallbackTo,
     costUsd: ok && typeof cost === 'number' ? cost : undefined,
   });

@@ -22,8 +22,8 @@ function test(name, fn) {
 
 console.log('\ncontext optimizer — adversarial safety');
 
-test('modes are exactly off | safe | aggressive', () => {
-  assert.deepEqual(CONTEXT_MODES, ['off', 'safe', 'aggressive']);
+test('modes are exactly off | safe | balanced | aggressive | custom', () => {
+  assert.deepEqual(CONTEXT_MODES, ['off', 'safe', 'balanced', 'aggressive', 'custom']);
 });
 
 test('OFF mode is a byte-identical identity', () => {

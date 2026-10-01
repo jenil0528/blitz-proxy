@@ -155,19 +155,20 @@ await test('STRICT mode: an explicit model failure can never switch — fallback
   assert.ok(plan.warnings.some(w => w.includes('strict mode')), 'the ignored chain is surfaced loudly');
 });
 
-await test('STRICT mode: a capability mismatch NEVER silently replaces the explicit model', async () => {
-  // meta/codellama-70b is tools:false — in enabled mode a tools request skips it
-  // when an alternative exists; strict mode must keep the user's choice.
+await test('STRICT mode: a capability mismatch returns a clear error — never a silent switch', async () => {
+  // meta/codellama-70b is tools:false — enabled mode switches to an alternative;
+  // strict mode must REFUSE with a client-visible error instead of switching.
   saveConfig({
     routing: 'manual', profile: '', fallbackMode: 'strict',
     provider: 'nvidia', model: 'meta/codellama-70b',
     fallbackChain: ['groq'], fallbackModels: {},
   });
   const plan = await planCandidates({ cfg: getConfig(), keyring, needs: { tools: true }, estTokens: 50 });
-  assert.ok(plan.candidates.length >= 1);
-  assert.equal(plan.candidates[0].provider, 'nvidia');
-  assert.equal(plan.candidates[0].model, 'meta/codellama-70b', 'explicit selection wins over capability heuristics');
-  assert.ok(plan.warnings.some(w => w.includes('strict mode: explicit selection wins')));
+  assert.equal(plan.candidates.length, 0, 'strict refuses to route an incompatible explicit selection');
+  assert.ok(plan.fatalError, 'a clear client-visible error is surfaced');
+  assert.ok(plan.fatalError.includes('Capability mismatch'), 'the error names the mismatch');
+  assert.ok(plan.fatalError.includes('meta/codellama-70b'), 'the error names the model');
+  assert.ok(plan.fatalError.includes('does not switch models'), 'the error explains the policy');
 });
 
 await test('ENABLED mode (default): fallback chain + capability switching still work', async () => {

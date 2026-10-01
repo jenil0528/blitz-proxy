@@ -26,6 +26,7 @@ const suites = [
   'validate.test.js',
   'registry.test.js',
   'context-optimizer.test.js',
+  'usage-capabilities.test.js',
   'server.test.js',
 ];
 

@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased — context control + token tracking + capability registry
+
+### Added — Advanced context control
+- Five optimizer modes: **off / safe / balanced / aggressive / custom** (`blitz context <mode>`), with per-operation custom flags (`blitz context custom <op> <on|off|recency N>`) and a **context lock** (`blitz context lock|unlock`) that freezes the policy until explicitly unlocked.
+- Optimizer stats now report the exact operations performed, and every mode keeps the adversarially-tested preservation guarantees (system/user text, recency window, tool_use/thinking/images untouched; critical removed always 0).
+
+### Added — Normalized token tracking
+- `src/usage.js` — ONE internal usage format for every provider shape: input, output, **cached input** (OpenAI `prompt_tokens_details.cached_tokens`, Anthropic cache reads + writes), **reasoning tokens**, totals. When a provider returns no usage, values are **ESTIMATED and marked as such** — never presented as exact.
+- `blitz usage [today|month|all] [model <m>|provider <p>]` — per-provider and per-model breakdowns, context-optimizer savings tracked as `context saved`, and an explicit `EXACT vs ESTIMATED` ratio.
+- Stats store extended (backward-compatible schema) with cached/reasoning/context-saved/estimated dimensions and per-model buckets.
+
+### Added — Model capability registry
+- `src/model-capabilities.js` — one normalized capability system for the whole gateway. Capabilities come only from verified catalog/adapter metadata; anything undeclared is **UNKNOWN (`?`) — never silently treated as supported**. Known-false capabilities fail validation; UNKNOWN never rejects a request.
+- STRICT mode now returns a clear `400 invalid_request_error` naming the mismatch instead of routing an incompatible explicit selection — the model is never silently switched.
+- CLI: `blitz model capabilities <model>` (✓ / ✗ / ? UNKNOWN display) and `blitz model test <model>` (real 1-token request via the canonical credential resolver).
+
+### Tests
+- 253 → **270 tests across 18 suites** — new usage/capabilities/context-modes suite; strict-mode test updated to the clear-error behavior.
+
+### Not implemented (honest scope)
+- Session/resume system (agent session adapters, `blitz sessions`/`blitz resume`) — deliberately deferred to the next increment rather than shipped half-tested.
+- Dashboard sections for usage/context — the CLI exposes all the data; the web dashboard keeps its existing sections for now.
+
 ## Unreleased — strict fallback + context optimization + compatibility tester
 
 ### Added — Strict fallback mode (explicit model selection always wins)

@@ -7,8 +7,11 @@
 // conservative and content-preserving by construction:
 //
 //   OFF         → identity, nothing is touched
-//   SAFE        → line-level, lossless ops only (see below)
-//   AGGRESSIVE  → SAFE + exact-duplicate whole-block collapse in OLD messages
+//   SAFE        → lossless line-level ops only (ANSI, duplicate runs, CR)
+//   BALANCED    → SAFE + exact-duplicate whole-block collapse in OLD messages
+//   AGGRESSIVE  → BALANCED + non-consecutive duplicate-line collapse in old
+//                 blocks + a narrower recency window
+//   CUSTOM      → per-operation flags via config `contextCustom`
 //
 // HARD SAFETY GUARANTEES (all modes that are not OFF):
 //   1. System prompts and USER TEXT are NEVER modified — instructions,
@@ -29,11 +32,27 @@
 // model calls and can hallucinate; see ARCHITECTURE.md.
 // ============================================================================
 
-export const CONTEXT_MODES = ['off', 'safe', 'aggressive'];
+export const CONTEXT_MODES = ['off', 'safe', 'balanced', 'aggressive', 'custom'];
 
-// Number of trailing messages that are never optimized (recency matters for
-// the agent's next action). SAFE keeps a wide window; AGGRESSIVE narrows it.
-const RECENCY_WINDOW = { safe: 6, aggressive: 2 };
+// Per-mode operation presets. CUSTOM merges over SAFE defaults with the
+// user's contextCustom flags.
+const MODE_PRESETS = {
+  safe:       { ansi: true, overwrites: true, duplicates: true, blankWalls: true, blockDedup: false, nonConsecutive: false, recency: 6 },
+  balanced:   { ansi: true, overwrites: true, duplicates: true, blankWalls: true, blockDedup: true,  nonConsecutive: false, recency: 4 },
+  aggressive: { ansi: true, overwrites: true, duplicates: true, blankWalls: true, blockDedup: true,  nonConsecutive: true,  recency: 2 },
+};
+
+/**
+ * Resolve the effective operation set for a mode.
+ * @param {string} mode  off | safe | balanced | aggressive | custom
+ * @param {Object} contextCustom  per-operation flags for custom mode
+ */
+export function resolveModeOptions(mode, contextCustom) {
+  if (mode === 'custom') {
+    return { ...MODE_PRESETS.safe, ...(contextCustom || {}) };
+  }
+  return MODE_PRESETS[mode] || MODE_PRESETS.safe;
+}
 
 const MIN_BLOCK_CHARS = 200;       // tiny blocks are never worth touching
 const DUPLICATE_RUN_MIN = 3;       // collapse runs of >=3 identical lines
@@ -117,26 +136,27 @@ function collapseBlankRuns(lines) {
   return out;
 }
 
-/** Apply the SAFE (lossless) line operations to a text payload. */
-function optimizeText(text, { aggressive }) {
+/** Apply the configured line-level operations to a text payload. */
+function optimizeText(text, ops) {
   if (typeof text !== 'string' || text.length < MIN_BLOCK_CHARS) return text;
 
-  let next = stripAnsi(text);
-  if (next.includes('\r')) {
+  let next = ops.ansi ? stripAnsi(text) : text;
+  if (ops.overwrites && next.includes('\r')) {
     next = collapseOverwrites(next.split('\n')).join('\n');
   }
   const lines = next.split('\n');
-  const deduped = collapseDuplicateRuns(lines);
-  const blanked = collapseBlankRuns(deduped);
-  let result = blanked.join('\n');
+  let current = lines;
+  if (ops.duplicates) current = collapseDuplicateRuns(current);
+  if (ops.blankWalls) current = collapseBlankRuns(current);
+  let result = current.join('\n');
 
-  if (aggressive) {
+  if (ops.nonConsecutive) {
     // AGGRESSIVE only: collapse duplicate lines even when separated by
     // other content within the SAME block (e.g. a wall of the same warning
     // interleaved with timestamps). First occurrence + count is preserved.
     const seen = new Map();
     const outLines = [];
-    for (const line of blanked) {
+    for (const line of current) {
       const t = line.trim();
       if (t !== '' && t.length >= 12 && !t.startsWith('… [')) {
         const n = seen.get(t) || 0;
@@ -226,12 +246,14 @@ function messageText(msg) {
  *
  * @param {Object} anthropicReq   parsed /v1/messages body (NEVER mutated)
  * @param {Object} opts
- * @param {string} opts.mode      'off' | 'safe' | 'aggressive'
+ * @param {string} opts.mode      'off' | 'safe' | 'balanced' | 'aggressive' | 'custom'
+ * @param {Object} [opts.custom] per-operation flags for custom mode (cfg.contextCustom)
  * @returns {{ messages, system, stats }}
  *   stats: { mode, originalTokens, optimizedTokens, tokensSaved, reductionPct,
- *            messagesTotal, messagesTouched, messagesPreserved, criticalRemoved }
+ *            messagesTotal, messagesTouched, messagesPreserved, criticalRemoved,
+ *            operations: string[] }
  */
-export function optimizeContext(anthropicReq, { mode = 'safe' } = {}) {
+export function optimizeContext(anthropicReq, { mode = 'safe', custom } = {}) {
   const originalMessages = anthropicReq?.messages;
   if (mode === 'off' || !Array.isArray(originalMessages) || originalMessages.length === 0) {
     return {
@@ -240,8 +262,11 @@ export function optimizeContext(anthropicReq, { mode = 'safe' } = {}) {
       stats: null,
     };
   }
-  const aggressive = mode === 'aggressive';
-  const recency = RECENCY_WINDOW[mode] || RECENCY_WINDOW.safe;
+  const ops = resolveModeOptions(mode, custom);
+  const recency = Number.isInteger(ops.recency) && ops.recency >= 0 ? ops.recency : 6;
+  const performed = new Set();
+
+  const note = (name) => performed.add(name);
 
   const originalTokens = estimateTokensFromChars(
     JSON.stringify(originalMessages) + JSON.stringify(anthropicReq?.system ?? '')
@@ -250,7 +275,33 @@ export function optimizeContext(anthropicReq, { mode = 'safe' } = {}) {
   const messages = [];
   let messagesTouched = 0;
   let messagesPreserved = 0;
-  const seenBlockTexts = new Map(); // AGGRESSIVE whole-block dedup (old blocks only)
+  const seenBlockTexts = new Map(); // block dedup (old blocks only, BALANCED+)
+
+  const runBlock = (block) => {
+    if (!blockIsOptimizable(block)) return null; // tool_use / thinking / image: untouched
+    const text = textOfBlock(block);
+    if (typeof text !== 'string') return null;
+    let optimized = optimizeText(text, ops);
+    if (optimized !== text) {
+      if (ops.ansi && stripAnsi(text) !== text) note('ansi-strip');
+      if (ops.overwrites && text.includes('\r')) note('carriage-return-collapse');
+      if (ops.duplicates) note('duplicate-line-collapse');
+      if (ops.blankWalls) note('blank-line-collapse');
+      if (ops.nonConsecutive) note('non-consecutive-duplicate-collapse');
+    }
+    if (ops.blockDedup) {
+      const key = `${block.type}::${optimized}`;
+      if (seenBlockTexts.get(key) === true) {
+        optimized = `… [duplicate of an earlier output block — collapsed]`;
+        note('block-dedup');
+      } else {
+        seenBlockTexts.set(key, true);
+      }
+    }
+    if (optimized === text) return null;
+    setTextOfBlock(block, optimized);
+    return true;
+  };
 
   for (let idx = 0; idx < originalMessages.length; idx++) {
     const msg = originalMessages[idx];
@@ -268,11 +319,7 @@ export function optimizeContext(anthropicReq, { mode = 'safe' } = {}) {
         let changed = false;
         for (const block of clone.content) {
           if (blockIsOptimizable(block) && block.type === 'tool_result') {
-            const text = textOfBlock(block);
-            if (typeof text === 'string') {
-              const optimized = optimizeText(text, { aggressive });
-              if (optimized !== text) { setTextOfBlock(block, optimized); changed = true; }
-            }
+            if (runBlock(block) === true) changed = true;
           }
         }
         messages.push(changed ? clone : msg);
@@ -289,21 +336,7 @@ export function optimizeContext(anthropicReq, { mode = 'safe' } = {}) {
       const clone = { ...msg, content: msg.content.map(b => ({ ...(b || {}) })) };
       let changed = false;
       for (const block of clone.content) {
-        if (!blockIsOptimizable(block)) continue; // tool_use / thinking / image: untouched
-        const text = textOfBlock(block);
-        if (typeof text !== 'string') continue;
-        let optimized = optimizeText(text, { aggressive });
-        if (aggressive) {
-          // whole-block dedup across OLD optimizable blocks only
-          const key = block.type === 'text' ? `A::${optimized}` : `T::${optimized}`;
-          const firstSeen = seenBlockTexts.get(key);
-          if (firstSeen === true) {
-            optimized = `… [duplicate of an earlier output block — collapsed]`;
-          } else {
-            seenBlockTexts.set(key, true);
-          }
-        }
-        if (optimized !== text) { setTextOfBlock(block, optimized); changed = true; }
+        if (runBlock(block) === true) changed = true;
       }
       messages.push(changed ? clone : msg);
       if (changed) messagesTouched++; else messagesPreserved++;
@@ -335,6 +368,7 @@ export function optimizeContext(anthropicReq, { mode = 'safe' } = {}) {
       messagesTouched,
       messagesPreserved,
       criticalRemoved: 0, // by construction; verified by adversarial tests
+      operations: [...performed],
     },
   };
 }
