@@ -354,6 +354,62 @@ await test('request IDs: success responses carry the header too', async () => {
   assert.ok(/^BLZ-[A-F0-9]{6}$/.test(stream.headers.get('x-blitz-request-id') || ''));
 });
 
+await test('STRICT mode: provider failure returns the error — never a silent model switch', async () => {
+  try {
+    saveConfig({ provider: 'mocka', model: 'mock/model-a', fallbackChain: ['mockb'], fallbackMode: 'strict', profile: '' });
+    mockA.setMode('429');
+    const requestsBefore = mockB.requests.length;
+    const res = await post('/v1/messages', anthropicReq());
+    assert.equal(res.status, 429, 'the rate limit itself must surface — no failover to mockB');
+    const data = await res.json();
+    assert.equal(data.error.type, 'rate_limit_error');
+    assert.equal(mockB.requests.length, requestsBefore, 'strict mode must not touch other providers');
+  } finally {
+    mockA.setMode('ok');
+    saveConfig({ provider: 'mocka', model: 'mock/model-a', fallbackChain: ['mockb'], fallbackMode: 'enabled', profile: '' });
+  }
+});
+
+await test('context optimization: duplicated tool output is compressed end-to-end with a transparency header', async () => {
+  try {
+    saveConfig({ contextOptimization: 'safe' });
+    const bigToolOutput = Array.from({ length: 300 }, () => 'npm WARN deprecated left-pad@1.3.0').join('\n');
+    const messages = [
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: bigToolOutput }] },
+      ...Array.from({ length: 8 }, () => ({ role: 'user', content: 'recent context padding' })),
+    ];
+    const res = await post('/v1/messages', JSON.stringify({ model: 'claude-3-5-sonnet-20241022', max_tokens: 100, messages }));
+    assert.equal(res.status, 200);
+    const data = await res.json();
+    assert.equal(data.content[0].text, 'Hello from mock!');
+    const reduction = res.headers.get('x-blitz-context-reduction');
+    assert.ok(reduction !== null && parseInt(reduction, 10) > 50, `header reports real reduction (got ${reduction}%)`);
+    assert.ok(res.headers.get('x-blitz-model'), 'actual model header present');
+    // The provider received the OPTIMIZED context
+    const last = mockA.requests[mockA.requests.length - 1];
+    const toolMsg = JSON.stringify(last.body.messages);
+    assert.ok(toolMsg.includes('[+299 duplicate lines collapsed]'), 'duplicates collapsed upstream');
+    assert.ok(!toolMsg.includes('left-pad@1.3.0".repeat'), 'sanity');
+  } finally {
+    saveConfig({ contextOptimization: 'off' });
+  }
+});
+
+await test('context optimization OFF: identical request passes through byte-identical', async () => {
+  saveConfig({ contextOptimization: 'off' });
+  const bigToolOutput = Array.from({ length: 300 }, () => 'npm WARN deprecated left-pad@1.3.0').join('\n');
+  const messages = [
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: bigToolOutput }] },
+    { role: 'user', content: 'go' },
+  ];
+  const res = await post('/v1/messages', JSON.stringify({ model: 'claude-3-5-sonnet-20241022', max_tokens: 100, messages }));
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('x-blitz-context-reduction'), null, 'no reduction header when OFF');
+  const last = mockA.requests[mockA.requests.length - 1];
+  const sent = last.body.messages.find(m => m.role === 'tool');
+  assert.ok(sent.content.includes('npm WARN deprecated left-pad@1.3.0'));
+});
+
 await test('GET /v1/models includes discovered models for the active provider', async () => {
   try {
     saveConfig({ discoveredModels: { mocka: { models: [{ id: 'mock/discovered-x', lastSeen: 'now' }], fetchedAt: 'now' } } });

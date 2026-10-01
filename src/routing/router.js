@@ -139,19 +139,31 @@ export async function planCandidates({ cfg, keyring, needs, estTokens, health })
   }
 
   if (orderedProviders.length === 0) {
-    // Manual mode: active provider first, then the configured fallback chain
+    // Manual mode: active provider first, then the configured fallback chain.
+    const strict = cfg.fallbackMode === 'strict';
+    const explicitModel = active.model && providerOwnsModel(active.providerId, active.model, cfg);
     orderedProviders = [{ provider: active.providerId, model: active.model }];
-    for (const fb of cfg.fallbackChain || []) {
-      if (fb === active.providerId) continue;
-      if (!known.includes(fb)) {
-        warnings.push(`fallback "${fb}" is not a known provider — skipped`);
-        continue;
+    if (strict && explicitModel) {
+      // STRICT mode: an explicitly selected model is authoritative. If it
+      // fails, the error is returned — never a silent switch to another
+      // provider/model. Credential rotation within the same provider+model
+      // still applies (that is not a model switch).
+      if ((cfg.fallbackChain || []).length > 0) {
+        warnings.push(`strict mode: explicit model ${active.providerId}/${active.model} set — fallback chain ignored`);
       }
-      if (!available.includes(fb)) {
-        warnings.push(`fallback "${fb}" has no key / is not configured — skipped`);
-        continue;
+    } else {
+      for (const fb of cfg.fallbackChain || []) {
+        if (fb === active.providerId) continue;
+        if (!known.includes(fb)) {
+          warnings.push(`fallback "${fb}" is not a known provider — skipped`);
+          continue;
+        }
+        if (!available.includes(fb)) {
+          warnings.push(`fallback "${fb}" has no key / is not configured — skipped`);
+          continue;
+        }
+        orderedProviders.push({ provider: fb, model: '' });
       }
-      orderedProviders.push({ provider: fb, model: '' });
     }
   }
 
@@ -208,10 +220,17 @@ export async function planCandidates({ cfg, keyring, needs, estTokens, health })
 
     const sat = modelSatisfies(c.provider, model, needs || {}, estTokens || 0);
     if (!sat.ok) {
-      skippedForCapability.push({ provider: c.provider, model, reasons: sat.reasons, creds: providerCreds });
-      continue;
+      // STRICT mode: never silently replace an explicitly selected model with
+      // a "more capable" one — user intent outranks capability heuristics.
+      if (cfg.fallbackMode === 'strict' && c.model) {
+        warnings.push(`⚠ ${c.provider}/${c.model}: ${sat.reasons.join('; ')} — using anyway (strict mode: explicit selection wins)`);
+      } else {
+        skippedForCapability.push({ provider: c.provider, model, reasons: sat.reasons, creds: providerCreds });
+        continue;
+      }
+    } else {
+      for (const r of sat.reasons || []) warnings.push(`${c.provider}: ${r}`);
     }
-    for (const r of sat.reasons || []) warnings.push(`${c.provider}: ${r}`);
 
     for (const cred of providerCreds) {
       candidates.push({

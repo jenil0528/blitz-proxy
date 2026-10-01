@@ -52,6 +52,8 @@ export const DEFAULT_CONFIG = {
   fallbackChain: [],             // provider ids tried after the active provider
   fallbackModels: {},            // { providerId: modelId } per-fallback model
   fallbackOnAuthError: false,    // auth failures do NOT failover by default
+  fallbackMode: 'enabled',       // 'enabled' | 'strict' — strict: explicit model fails → error, never a silent switch
+  contextOptimization: 'safe',  // 'off' | 'safe' | 'aggressive' — context optimizer mode
   proxyPort: 4819,
   host: '127.0.0.1',             // local-first; never 0.0.0.0 by default
   requireAuth: false,            // token required for /v1/* (admin always requires it)

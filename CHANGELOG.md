@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased — strict fallback + context optimization + compatibility tester
+
+### Added — Strict fallback mode (explicit model selection always wins)
+- `blitz config set fallbackMode strict` — an explicitly selected model is authoritative: the fallback chain is ignored (loudly), capability heuristics can never silently replace the selection, and a provider failure returns the provider's real error. Credential rotation (same provider, different key) still applies — it is not a model switch. Default `enabled` preserves existing behavior.
+
+### Added — Context optimization (privacy-first, safety-first)
+- `src/context-optimizer.js` on the `/v1/messages` path, modes `off` / `safe` (default) / `aggressive` via `blitz config set contextOptimization`.
+- SAFE ops are lossless by construction: ANSI stripping, carriage-return progress resolution, duplicate-line collapse with explicit `[+N]` markers, blank-wall collapse. System prompts, user text, recency window (last 6), and tool_use/thinking/image blocks are never touched — verified by 16 adversarial tests (old instructions, security constraints, compiler errors inside huge logs, progress bars, malformed input).
+- AGGRESSIVE adds exact-duplicate whole-block collapse in old messages. Semantic summarization deliberately NOT implemented (would require model calls; can hallucinate).
+- Transparency: `X-Blitz-Context-Reduction` header, `CONTEXT` log lines, pure-function reversibility with automatic fallback to the original context on optimizer error.
+
+### Added — Request transparency & compatibility
+- `X-Blitz-Model` response header: the model ACTUALLY used (vs the requested one) on every successful response.
+- `blitz compatibility` — runs the live end-to-end suite (Anthropic/OpenAI/Responses, streaming, tool calls, credential validation) against your real provider; explicit user action, never prints keys.
+- `blitz cline` / `blitz roo` — honest setup values for the Cline/Roo Code VS Code extensions (they are editor extensions, not launchable CLIs — no fake launcher).
+
+### Tests
+- 231 → **253 tests across 17 suites** — new `context-optimizer.test.js` (16 adversarial safety tests), strict-mode router tests, strict-mode + context-optimization end-to-end server tests.
+
 ## Unreleased — BLITZ gateway evolution
 
 ### Added — Canonical credential resolution & smart rotation

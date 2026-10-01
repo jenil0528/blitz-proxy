@@ -154,6 +154,15 @@ export function validateConfig(cfg, opts = {}) {
     if (cfg.routing !== 'manual' && cfg.routing !== 'auto') {
       err(`"routing" must be "manual" or "auto" — got "${cfg.routing}"`);
     }
+    if (cfg.fallbackMode !== undefined && cfg.fallbackMode !== 'enabled' && cfg.fallbackMode !== 'strict') {
+      err(`"fallbackMode" must be "enabled" or "strict" — got ${JSON.stringify(cfg.fallbackMode)}`);
+    }
+    if (cfg.fallbackMode === 'strict' && (cfg.fallbackChain || []).length > 0) {
+      warn('strict mode ignores the fallback chain — an explicit model failure returns an error instead of switching');
+    }
+    if (cfg.contextOptimization !== undefined && !['off', 'safe', 'aggressive'].includes(cfg.contextOptimization)) {
+      err(`"contextOptimization" must be "off", "safe" or "aggressive" — got ${JSON.stringify(cfg.contextOptimization)}`);
+    }
     if (!Number.isInteger(cfg.proxyPort) || cfg.proxyPort < 1 || cfg.proxyPort > 65535) {
       err(`"proxyPort" must be an integer between 1 and 65535 — got ${JSON.stringify(cfg.proxyPort)}`);
     }

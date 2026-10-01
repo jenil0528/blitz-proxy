@@ -140,5 +140,45 @@ await test('multiple keys per provider → one candidate per key, active key fir
   assert.equal(plan.candidates[2].key, 'gsk_routertest2222bbbb');
 });
 
+await test('STRICT mode: an explicit model failure can never switch — fallback chain ignored', async () => {
+  saveConfig({
+    routing: 'manual', profile: '', fallbackMode: 'strict',
+    provider: 'nvidia', model: 'nvidia/nemotron-3-super-120b-a12b',
+    fallbackChain: ['groq'], fallbackModels: {},
+  });
+  const plan = await planCandidates({ cfg: getConfig(), keyring, needs: { tools: true }, estTokens: 100 });
+  assert.equal(plan.candidates.length, 2, 'both NVIDIA credentials remain — rotation is not a model switch');
+  for (const c of plan.candidates) {
+    assert.equal(c.provider, 'nvidia', 'no other provider may appear in strict mode');
+    assert.equal(c.model, 'nvidia/nemotron-3-super-120b-a12b', 'the explicit model only');
+  }
+  assert.ok(plan.warnings.some(w => w.includes('strict mode')), 'the ignored chain is surfaced loudly');
+});
+
+await test('STRICT mode: a capability mismatch NEVER silently replaces the explicit model', async () => {
+  // meta/codellama-70b is tools:false — in enabled mode a tools request skips it
+  // when an alternative exists; strict mode must keep the user's choice.
+  saveConfig({
+    routing: 'manual', profile: '', fallbackMode: 'strict',
+    provider: 'nvidia', model: 'meta/codellama-70b',
+    fallbackChain: ['groq'], fallbackModels: {},
+  });
+  const plan = await planCandidates({ cfg: getConfig(), keyring, needs: { tools: true }, estTokens: 50 });
+  assert.ok(plan.candidates.length >= 1);
+  assert.equal(plan.candidates[0].provider, 'nvidia');
+  assert.equal(plan.candidates[0].model, 'meta/codellama-70b', 'explicit selection wins over capability heuristics');
+  assert.ok(plan.warnings.some(w => w.includes('strict mode: explicit selection wins')));
+});
+
+await test('ENABLED mode (default): fallback chain + capability switching still work', async () => {
+  saveConfig({
+    routing: 'manual', profile: '', fallbackMode: 'enabled',
+    provider: 'nvidia', model: 'meta/codellama-70b',
+    fallbackChain: ['groq'], fallbackModels: {},
+  });
+  const plan = await planCandidates({ cfg: getConfig(), keyring, needs: { tools: true }, estTokens: 50 });
+  assert.equal(plan.candidates[0].provider, 'groq', 'capability mismatch switches when fallback is enabled');
+});
+
 console.log(`\n${passed + failed} tests — ${passed} passed, ${failed} failed\n`);
 if (failed > 0) process.exit(1);

@@ -60,6 +60,7 @@ other clients ──────▶  ┌────────────┐ 
 | `src/routing/profiles.js` | Built-in + user profiles, chain parsing, local-only enforcement |
 | `src/models-cache.js` | Model discovery cache — merge/dedupe/preserve, never fabricates capabilities |
 | `src/aliases.js` | Model aliases (`coding → nvidia/z-ai/glm-5.3`), single deterministic lookup |
+| `src/context-optimizer.js` | Privacy-first context optimization (off/safe/aggressive) — lossless noise removal with adversarially-tested preservation guarantees |
 | `src/security/keyring.js` | Platform vault: DPAPI/Keychain/Secret Service/file/memory |
 | `src/security/auth.js` | Proxy token generation, constant-time checks, extraction |
 | `src/security/lan.js` | Loopback detection + `assertSafeBind` — non-loopback without auth refuses to start |
@@ -94,6 +95,23 @@ other clients ──────▶  ┌────────────┐ 
 Every subsystem — requests, health checks, `blitz validate`, `blitz health`, model discovery, CLI status — resolves credentials through `src/credentials.js`. Nothing may index `keys[0]` directly.
 
 Priority: explicit credential id → vault-active credential → healthiest eligible (fewest recent failures, then vault order) → rate-limit-cooled → invalid-held as last resort (keys can recover upstream, so they are never permanently excluded). States are in-process per credential id; `credentialStats()` exposes them without key material for status/doctor.
+
+Circuit-breaker semantics: the credential state machine implements CLOSED (healthy) → OPEN (invalid hold / cooldown: requests skip it) → HALF_OPEN (hold expiry: the credential re-enters selection as a last-resort tier, probed by real traffic) → CLOSED on the first success. Provider-level health marks (`src/routing/health.js`) follow the same pattern per provider.
+
+## Fallback Modes (explicit model selection always wins)
+
+`fallbackMode: 'enabled'` (default, backward compatible): manual mode uses the active provider first, then the configured fallback chain; capability mismatches switch when an alternative exists.
+
+`fallbackMode: 'strict'`: an explicitly selected model is authoritative. The fallback chain is ignored (loudly), capability heuristics cannot replace the selection, and a provider failure returns the provider's own error — requested model = actual model. Credential rotation (same provider, different key) still applies because it is not a model switch. Profiles are explicit chains by construction; auto routing only engages when no explicit model was selected.
+
+## Context Optimization (`src/context-optimizer.js`)
+
+Applied on the `/v1/messages` path before translation. Modes: `off` (identity), `safe` (default), `aggressive`.
+
+- SAFE operations are lossless by construction: ANSI escape stripping, carriage-return overwrite resolution (final state kept), duplicate consecutive lines collapsed to first occurrence + `[+N duplicate lines collapsed]` marker, blank-line wall collapse.
+- Never modified: system prompts, user text (instructions/decisions/security constraints at any age), the last N messages (recency window: safe 6 / aggressive 2), `tool_use`/`thinking`/`image` blocks.
+- AGGRESSIVE adds exact-duplicate whole-block collapse across OLD optimizable blocks (first copy kept, later copies marked) and narrows the recency window to 2. Semantic summarization is intentionally NOT implemented (requires model calls and can hallucinate — violates the no-fake-features rule).
+- Pure function over a copy; the server falls back to the unmodified context on any optimizer error. Transparency: `X-Blitz-Context-Reduction` header, `CONTEXT` log line (original→optimized tokens, criticalRemoved: 0); guarantees verified by adversarial tests in `test/context-optimizer.test.js`.
 
 ## Configuration Flow
 

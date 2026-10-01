@@ -83,6 +83,10 @@ async function main() {
     case 'opencode':       return await cmdRun(['opencode', ...args]);
     case 'codex':          return await cmdRun(['codex', ...args]);
     case 'aider':          return await cmdRun(['aider', ...args]);
+    case 'cline':
+    case 'roo':
+    case 'roocode':        return cmdEditorAgentHelp();
+    case 'compatibility':  return await cmdCompatibility();
 
     // ── Routing ──
     case 'profile':
@@ -304,6 +308,55 @@ async function cmdStatus() {
   console.log(`    Credentials:  ${keys.length} in ${globalThis.__blitzMode} keyring${keys.some(k => k.provider === active.providerId && k.id !== activeCred?.id) ? '  •  rotation ready' : ''}`);
   console.log(`    Models:       ${modelCount}${Object.keys(cfg.aliases || {}).length ? `  •  aliases: ${Object.keys(cfg.aliases).join(', ')}` : ''}`);
   console.log(`    Privacy:      ${cfg.privacy ? `${C.grn}ON${C.r}` : 'off'}  •  Config: ${CONFIG_PATH}\n`);
+}
+
+// ─── Agent support: editors + compatibility tester ──────────────────────────
+
+/**
+ * Cline and Roo Code are VS Code EXTENSIONS, not terminal CLIs — they cannot
+ * be launched from here. Instead of faking it, give the exact setup values
+ * the extension needs (never the token itself — point at `blitz token`).
+ */
+function cmdEditorAgentHelp() {
+  const cfg = getConfig();
+  console.log(`\n${C.b}Cline / Roo Code — connect through BLITZ${C.r}\n`);
+  console.log(`  These agents run inside VS Code, so there is nothing to launch from the`);
+  console.log(`  terminal. Point the extension at the BLITZ gateway:\n`);
+  console.log(`  ${C.d}1. In the extension's settings, choose an OpenAI-compatible provider.${C.r}`);
+  console.log(`  ${C.d}2. Base URL:  ${C.blu}http://${cfg.host || '127.0.0.1'}:${cfg.proxyPort}/v1${C.r}${C.d}`);
+  console.log(`     (use a LAN-visible host + ${C.b}requireAuth=true${C.r}${C.d} if VS Code runs elsewhere)${C.r}`);
+  console.log(`  ${C.d}3. API key:    your BLITZ token — print it with ${C.b}blitz token${C.r}${C.d}`);
+  console.log(`  ${C.d}4. Model:      anything from ${C.b}blitz models${C.r}${C.d} — BLITZ routes to the active model${C.r}\n`);
+  console.log(`  ${C.d}Verify the gateway first: ${C.b}blitz compatibility${C.r}\n`);
+}
+
+/**
+ * Run the LIVE end-to-end compatibility suite (test/live.js) against the real
+ * configured provider: Anthropic + OpenAI + Responses endpoints, streaming,
+ * tool calls, credential validation. Explicit user action — costs a few
+ * tokens, never prints keys.
+ */
+async function cmdCompatibility() {
+  const cfg = getConfig();
+  const livePath = join(__dirname, 'test', 'live.js');
+  if (!existsSync(livePath)) {
+    console.log(`${C.red}✕ live test suite not found: ${livePath}${C.r}`);
+    process.exit(1);
+  }
+  const active = await resolveActiveProvider(cfg, keyring);
+  console.log(`${C.b}BLITZ compatibility check${C.r}  ${C.d}— live requests against ${active.def?.name || active.providerId} (${active.model || 'default'})`);
+  console.log(`${C.d}This makes real (tiny) API requests using your stored credentials. Keys are never printed.${C.r}\n`);
+  const child = spawn(process.execPath, [livePath], {
+    stdio: 'inherit',
+    cwd: __dirname,
+    env: { ...process.env, BLITZ_LIVE_TESTS: '1', BLITZ_CONFIG: process.env.BLITZ_CONFIG || '' },
+    windowsHide: true,
+  });
+  child.on('error', err => {
+    console.log(`${C.red}✕ failed to start: ${err.message}${C.r}`);
+    process.exit(1);
+  });
+  child.on('exit', code => process.exit(code ?? 0));
 }
 
 // ─── blitz run / blitz shell (no global env hijack) ──────────────────────────

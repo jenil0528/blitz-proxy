@@ -25,6 +25,7 @@ import { translateResponsesRequest, translateResponsesResponse, translateRespons
 import { withRetry } from './retry.js';
 import { resolveCredential, markCredentialRejected, markCredentialRateLimited, markCredentialHealthy } from './credentials.js';
 import { newDiscoveredIds } from './models-cache.js';
+import { optimizeContext } from './context-optimizer.js';
 import { requestNeeds, requestNeedsOpenAI, estimateTokens } from './routing/capabilities.js';
 import { planCandidates, resolveActiveProvider } from './routing/router.js';
 import { classifyHttpError, classifyNetworkError } from './routing/fallback.js';
@@ -418,9 +419,30 @@ export function createProxyServer({ keyring, stats, token }) {
     }
 
     const cfg = getConfig();
+
+    // Context optimization (OFF/SAFE/AGGRESSIVE). Pure-function optimizer with
+    // a hard guarantee trail: original request preserved, errors fall back to
+    // the unmodified context, reduction surfaced via header + logs.
+    let effectiveReq = anthropicReq;
+    let ctxStats = null;
+    try {
+      const optimized = optimizeContext(anthropicReq, { mode: cfg.contextOptimization });
+      if (optimized.stats) {
+        effectiveReq = { ...anthropicReq, messages: optimized.messages, system: optimized.system };
+        ctxStats = optimized.stats;
+        if (ctxStats.reductionPct > 0) {
+          appendLog(`[${logTimestamp()}] CONTEXT ${ctxStats.mode} ${ctxStats.originalTokens}→${ctxStats.optimizedTokens} tok (${ctxStats.reductionPct}% saved, critical removed: 0) req=${requestId}`);
+        }
+      }
+    } catch (err) {
+      log.warn(`[Context] optimizer failed — using the original context untouched: ${err.message}`);
+      effectiveReq = anthropicReq;
+      ctxStats = null;
+    }
+
     const isStream = anthropicReq.stream === true;
-    const needs = requestNeeds(anthropicReq);
-    const estTokens = estimateTokens(anthropicReq);
+    const needs = requestNeeds(effectiveReq);
+    const estTokens = estimateTokens(effectiveReq);
     const plan = await planCandidates({ cfg, keyring, needs, estTokens, health });
 
     for (const w of plan.warnings) log.warn(`[Router] ${w}`);
@@ -430,7 +452,7 @@ export function createProxyServer({ keyring, stats, token }) {
       return;
     }
 
-    log.proxy('in', `model=${anthropicReq.model || 'default'} stream=${isStream} msgs=${anthropicReq.messages?.length || 0} tools=${anthropicReq.tools?.length || 0} candidates=${plan.candidates.length} req=${requestId}`);
+    log.proxy('in', `model=${anthropicReq.model || 'default'} stream=${isStream} msgs=${anthropicReq.messages?.length || 0} tools=${anthropicReq.tools?.length || 0} candidates=${plan.candidates.length} req=${requestId}${ctxStats ? ` ctx=${ctxStats.reductionPct}%` : ''}`);
 
     let lastCls = null;
     let lastDetail = '';
@@ -441,7 +463,7 @@ export function createProxyServer({ keyring, stats, token }) {
       if (!baseDef) continue;
       const def = effectiveDef(baseDef, cfg);
       const adapter = getAdapter(def);
-      const { body: openaiBody, toolIdMap } = translateRequest(anthropicReq, cand.model);
+      const { body: openaiBody, toolIdMap } = translateRequest(effectiveReq, cand.model);
       const started = Date.now();
 
       try {
@@ -496,6 +518,10 @@ export function createProxyServer({ keyring, stats, token }) {
 
         // ── Success: from here on, no provider switching mid-response ──
         markCredentialHealthy(cand.credentialId);
+        // Request transparency: the ACTUAL model used (may differ from the
+        // requested one when fallback is enabled) + context reduction.
+        res.setHeader('X-Blitz-Model', cand.model);
+        if (ctxStats) res.setHeader('X-Blitz-Context-Reduction', String(ctxStats.reductionPct));
         if (isStream) {
           res.writeHead(200, {
             'Content-Type': 'text/event-stream',

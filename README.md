@@ -1,4 +1,4 @@
-![version](https://img.shields.io/badge/version-2.0.0-blue) ![node](https://img.shields.io/badge/node-18%2B-green) ![zero deps](https://img.shields.io/badge/dependencies-zero-brightgreen) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Mac%20%7C%20Linux-lightgrey) ![tests](https://img.shields.io/badge/tests-231%20passed%20%2F%2016%20suites-brightgreen) ![CI](https://github.com/jenil0528/blitz-proxy/actions/workflows/ci.yml/badge.svg)
+![version](https://img.shields.io/badge/version-2.0.0-blue) ![node](https://img.shields.io/badge/node-18%2B-green) ![zero deps](https://img.shields.io/badge/dependencies-zero-brightgreen) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Mac%20%7C%20Linux-lightgrey) ![tests](https://img.shields.io/badge/tests-253%20passed%20%2F%2017%20suites-brightgreen) ![CI](https://github.com/jenil0528/blitz-proxy/actions/workflows/ci.yml/badge.svg)
 
 # ⚡ BlitzProxy
 
@@ -30,7 +30,10 @@ BlitzProxy works perfectly with a single provider — routing, fallback, health,
 - **Health that reflects reality** — real request outcomes (401/403/429/5xx) are pinned over cheap probes, per provider AND per credential
 - **Config validation** — `blitz config validate` checks providers, credentials, models, profiles, fallback chains, ports, timeouts — read-only, actionable, never prints secrets
 - **LAN-safe by refusal** — binding a non-loopback host without authentication makes the server refuse to start
-- **Request correlation** — every response carries `X-Blitz-Request-Id`; errors include it as `request_id`
+- **Request correlation** — every response carries `X-Blitz-Request-Id`; errors include it as `request_id`; responses also carry `X-Blitz-Model` (the model actually used) and `X-Blitz-Context-Reduction`
+- **Strict fallback mode** — `blitz config set fallbackMode strict`: an explicitly selected model never gets silently switched; failures return the provider's real error
+- **Context optimization** — safely strips ANSI noise and collapses duplicated terminal output before it reaches the model; instructions, errors, tool calls, and recent context are provably preserved (adversarially tested); `off`/`safe`/`aggressive`
+- **Compatibility tester** — `blitz compatibility` runs live end-to-end checks (all three APIs, streaming, tools) against your real provider; `blitz cline` prints exact setup values for editor extensions
 - **Secure by default** — keys in the OS keyring (Windows DPAPI / macOS Keychain / Linux Secret Service), masked everywhere, redacted from every log, local-only binding, token-gated admin
 - **Zero dependencies** — no `npm install`, no supply chain, Node.js 18+ is the only requirement
 - **Invisible background operation (Windows)** — the proxy and all its helper processes (keyring, process management) run fully hidden: no console windows flash on your screen while you work
@@ -223,7 +226,22 @@ blitz fallback list        # nvidia → groq → openrouter
 
 Failover happens for **rate limits, timeouts, 5xx, network errors, context overflow, and missing models** — never for invalid requests or TLS errors, and **not for auth errors by default** (`blitz config set fallbackOnAuthError true` to opt in). The one exception: a rejected key rotates to your next key for the same provider first (see above). Failover only ever happens **before the first streamed byte**; once streaming has begun, a provider failure produces an explicit `error` event instead of a silently truncated response.
 
-**Automatic mode:** `blitz auto` — ranks available providers per request by health snapshot, capability match (tools/vision/context window), and a priority list. Capability-aware routing means a tools request never silently lands on a tool-less model when an alternative exists.
+### Fallback modes: `strict` vs `enabled` — explicit model selection always wins
+
+```bash
+blitz config set fallbackMode strict    # explicit model fails → return the error. Never switch.
+blitz config set fallbackMode enabled    # default: fall over per the rules above
+```
+
+In **strict mode** an explicitly selected model is authoritative:
+
+- the fallback chain is ignored entirely (loudly, with a warning)
+- a capability mismatch **never silently replaces** your model — your choice outranks the heuristics
+- if the model fails, the provider's own error is returned to the client — requested model = actual model, always
+
+Credential rotation still applies in strict mode — trying your *next key for the same provider* is not a model switch. The same distinction is visible everywhere: responses carry `X-Blitz-Model` (the model actually used) next to `X-Blitz-Request-Id`, and request logs correlate requested vs actual model via the request id.
+
+**Automatic mode:** `blitz auto` — ranks available providers per request by health snapshot, capability match (tools/vision/context window), and a priority list. Capability-aware routing means a tools request never silently lands on a tool-less model when an alternative exists. Auto routing only applies when no explicit model was selected — user intent always outranks the ranking.
 
 **Profiles** — named chains for different work styles:
 
@@ -246,6 +264,29 @@ blitz health         # live checks per provider (deep: verifies with a real requ
 Health has two layers:
 - **Cheap probes** (`/models`) with a TTL cache — provider APIs are never spammed
 - **Passive marks from real traffic** — a live 401/403/429/5xx pins the provider as `AUTH-FAILED` / `RATE-LIMITED` / `UNAVAILABLE` for a hold window (auth: 5 min), overriding any probe result. The dashboard and auto-routing trust real outcomes over probes — so a provider that answers health checks fine but rejects your requests is shown as broken, because it is.
+
+## Context Optimization
+
+Coding agents shovel enormous terminal output — build logs, `npm install` walls, directory listings — into your context. The optimizer removes that noise **without ever deleting information**, on the `/v1/messages` path:
+
+```bash
+blitz config set contextOptimization safe        # default
+blitz config set contextOptimization aggressive
+blitz config set contextOptimization off
+```
+
+**What it does (SAFE, the default):** strips ANSI escape codes (terminal formatting, not content), keeps only the final state of carriage-return progress lines, collapses runs of identical lines to the first occurrence plus an explicit `[+N duplicate lines collapsed]` marker, and collapses blank-line walls.
+
+**What it NEVER does — guaranteed and adversarially tested:**
+
+- system prompts and **user text are never modified** — an instruction from 30 messages back ("Use PostgreSQL", "never expose API keys") survives byte-identical, no matter how old
+- the **last 6 messages are never touched** (recency drives the next action)
+- `tool_use`, `thinking`, and image blocks are never modified
+- nothing is deleted: duplicates keep the first occurrence + count, so information is compressed, not lost — "critical content removed: 0" is a stat reported on every request
+
+**AGGRESSIVE** additionally collapses exact-duplicate whole output blocks in *old* messages (first copy kept, later copies marked) and narrows the recency window to 2. Semantic summarization is deliberately **not implemented** — it would require model calls and can hallucinate; noise removal doesn't.
+
+Every optimized request is transparent: `X-Blitz-Context-Reduction` header (percent saved), a `CONTEXT` log line (original→optimized tokens, critical-removed count), and full reversibility — the optimizer is a pure function over a copy; if it ever fails, the request proceeds with the original context untouched.
 
 ## Dashboard & Stats
 
@@ -354,7 +395,7 @@ blitz config set proxyPort 4818
 ## Development
 
 ```bash
-npm test            # 231 tests, 16 suites — mocked providers behind real HTTP servers, no real keys
+npm test            # 253 tests, 17 suites — mocked providers behind real HTTP servers, no real keys
 npm run lint        # syntax check over all sources
 npm run dev         # watch-mode server
 npm run test:live   # OPT-IN live tests — set BLITZ_LIVE_TESTS=1 first; uses your real provider
@@ -366,11 +407,11 @@ Live tests (Anthropic + OpenAI + Responses endpoints, streaming, tool calls, rea
 
 | Area | Commands |
 |---|---|
-| Run & agents | `blitz` · `blitz claude/opencode/codex/aider` · `blitz run <cmd>` · `blitz shell` · `blitz start/stop/restart/status` |
+| Run & agents | `blitz` · `blitz claude/opencode/codex/aider` · `blitz cline` (setup values) · `blitz run <cmd>` · `blitz shell` · `blitz start/stop/restart/status` |
 | Credentials | `blitz add` · `credentials` · `switch` · `rm` · `validate` |
 | Models | `blitz model` · `models` · `models refresh` · `use <provider/model>` · `alias` |
-| Routing | `blitz provider` · `auto` · `fallback` · `profile` |
-| Insight & safety | `blitz health` · `stats` · `logs` · `dashboard` · `doctor` · `config validate` · `config` · `privacy` · `token` |
+| Routing | `blitz provider` · `auto` · `fallback` · `profile` · `config set fallbackMode strict` · `config set contextOptimization safe` |
+| Insight & safety | `blitz health` · `stats` · `logs` · `dashboard` · `doctor` · `config validate` · `compatibility` · `config` · `privacy` · `token` |
 
 ## License
 
