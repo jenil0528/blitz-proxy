@@ -99,6 +99,7 @@ async function main() {
     case 'sessions':        return cmdSessions();
     case 'session':         return await cmdSession(args);
     case 'resume':          return await cmdResume(args);
+    case 'requests':        return cmdRequests(args);
 
     // ── Routing ──
     case 'profile':
@@ -401,6 +402,55 @@ function contextModeOptions(cfg) {
   return cfg.contextOptimization === 'custom' ? { ...safe, ...(cfg.contextCustom || {}) } : safe;
 }
 
+// ─── Request inspector (blitz.log is metadata-only; nothing in privacy mode) ──
+
+async function cmdRequests(args) {
+  const n = Math.min(Math.max(parseInt(args[0], 10) || 20, 1), 100);
+  const cfg = getConfig();
+  if (cfg.privacy === true) {
+    console.log(`${C.d}Privacy mode is ON — request logging is disabled. Turn it off with: blitz privacy${C.r}`);
+    return;
+  }
+  if (!existsSync(LOG_PATH)) {
+    console.log(`${C.d}No request log yet at ${LOG_PATH}${C.r}`);
+    return;
+  }
+  const lines = readFileSync(LOG_PATH, 'utf-8').trim().split('\n').slice(-n * 6); // events cluster per request
+  const byReq = new Map();
+  const order = [];
+  for (const line of lines) {
+    const m = line.match(/\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s+(POST|GET)\s+(\S+)\s+→\s+(\d{3})\s+OK?\s+\((\d+)ms\)\s+(\S+)\s*(\[[^\]]*\])?\s*req=(BLZ-[A-F0-9]{6})/);
+    if (!m) {
+      // correlate events (CONTEXT/ROTATE/FALLBACK/ERROR) to their request id
+      const em = line.match(/\[([^\]]+)\]\s+(CONTEXT|ROTATE|FALLBACK|ERROR)\s+(.*)\s*req=(BLZ-[A-F0-9]{6})/);
+      if (em) {
+        const id = em[4];
+        if (byReq.has(id)) {
+          byReq.get(id).events.push(em[2] + (em[3].slice(0, 60)));
+        }
+      }
+      continue;
+    }
+    const [, time, , endpoint, status, latency, model, flags, reqId] = m;
+    if (!byReq.has(reqId)) {
+      byReq.set(reqId, { time: time.slice(11), endpoint, status, latency, model, flags: (flags || '').trim(), events: [] });
+      order.push(reqId);
+    }
+  }
+  const rows = order.slice(-n).reverse().map(id => byReq.get(id));
+  if (rows.length === 0) {
+    console.log(`${C.d}No completed requests in the recent log. Make one: blitz test${C.r}`);
+    return;
+  }
+  console.log(`\n${C.b}Recent requests${C.r}  ${C.d}— last ${rows.length} • metadata only, never prompts${C.r}\n`);
+  for (const r of rows) {
+    const color = r.status.startsWith('2') ? C.grn : r.status.startsWith('4') ? C.yel : C.red;
+    console.log(`  ${C.d}${r.time}${C.r} ${color}${r.status}${C.r} ${r.endpoint.padEnd(22)} ${String(r.latency + 'ms').padStart(9)}  ${C.b}${r.model}${C.r}${r.flags ? ` ${C.d}${r.flags}${C.r}` : ''}  ${C.d}${r.id || ''}${C.r}`);
+    if (r.events.length) console.log(`      ${C.d}→ ${r.events.join(' • ').slice(0, 160)}${C.r}`);
+  }
+  console.log(`\n${C.d}Correlate with request ids in client errors (request_id) • context events show optimizer savings${C.r}\n`);
+}
+
 // ─── Usage reporting (normalized token accounting) ───────────────────────────
 
 async function cmdUsage(args) {
@@ -419,7 +469,7 @@ async function cmdUsage(args) {
   }
 
   const stats = createStats({ home: HOME, privacy: cfg.privacy === true });
-  const { providers, models } = stats.getUsage({ scope });
+  const { providers, models, agents } = stats.getUsage({ scope });
   const label = scope === 'today' ? 'Today' : scope === 'month' ? 'This month' : 'All time';
 
   const rows = filter?.kind === 'provider'
@@ -459,6 +509,14 @@ async function cmdUsage(args) {
     for (const m of modelRows) {
       const total = (m.inputTokens || 0) + (m.outputTokens || 0);
       console.log(`    ${(m.model || '—').padEnd(42).slice(0, 42)} ${fmtTok(total).padStart(8)}  ${C.d}${m.requests} req${C.r}`);
+    }
+  }
+  const agentRows = (agents || []).filter(a => a.agent !== 'unknown').slice(0, 5);
+  if (agentRows.length > 0) {
+    console.log(`\n  ${C.b}By agent${C.r}  ${C.d}(User-Agent attribution — best-effort)${C.r}`);
+    for (const a of agentRows) {
+      const total = (a.inputTokens || 0) + (a.outputTokens || 0);
+      console.log(`    ${(a.agent || '—').padEnd(42).slice(0, 42)} ${fmtTok(total).padStart(8)}  ${C.d}${a.requests} req${C.r}`);
     }
   }
   console.log();
@@ -557,6 +615,7 @@ async function cmdRun(args) {
   const session = sessionStore.create({
     agent: AGENTS[command]?.label || command,
     projectDir: process.cwd(),
+    gitRoot: gitRootIn(process.cwd()),
     gitBranch: gitBranchIn(process.cwd()),
     model: cfg.model,
     profile: cfg.profile,
@@ -568,7 +627,7 @@ async function cmdRun(args) {
     env: blitzEnv(cfg, token),
     shell: process.platform === 'win32',
   });
-  if (child.pid) sessionStore.touch(session.id, { pid: child.pid });
+  if (child.pid) sessionStore.touch(session.id, { pid: child.pid, status: 'ACTIVE' });
 
   child.on('error', (err) => {
     sessionStore.touch(session.id, { status: 'FAILED' });
@@ -590,6 +649,17 @@ async function cmdRun(args) {
 function gitBranchIn(dir) {
   try {
     const r = spawnSync('git', ['-C', dir, 'rev-parse', '--abbrev-ref', 'HEAD'], {
+      encoding: 'utf-8', timeout: 3000, windowsHide: true,
+    });
+    if (r.status === 0) return (r.stdout || '').trim();
+  } catch { /* not a repo / git missing */ }
+  return '';
+}
+
+/** Git repository root for session metadata — empty outside a repo. */
+function gitRootIn(dir) {
+  try {
+    const r = spawnSync('git', ['-C', dir, 'rev-parse', '--show-toplevel'], {
       encoding: 'utf-8', timeout: 3000, windowsHide: true,
     });
     if (r.status === 0) return (r.stdout || '').trim();

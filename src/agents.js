@@ -1,38 +1,23 @@
 // ============================================================================
-// BLITZ — Agent Adapters
-// Agent-specific knowledge lives HERE and nowhere else. Adapters answer:
-//   - is the agent installed?        detect()
-//   - can it resume natively?       nativeResume
-//   - what is the resume command?    resumeArgs()
-//   - what are its native sessions? nativeSessions() (when discoverable)
+// BLITZ — Agent Session Adapters
+// ONE adapter interface per agent; agent-specific knowledge lives HERE and
+// nowhere else. Conceptual interface (AgentSessionAdapter):
+//
+//   detect()                        is the agent installed?
+//   canResume()                     does a NATIVE resume mechanism exist?
+//   listNativeSessions(projectDir)  the agent's own session records (or null)
+//   getNativeSessionId(projectDir)   newest native session id (or null)
+//   resumeArgs(projectDir)          CLI args that resume the agent natively
 //
 // HONESTY RULE: if an agent does not expose a reliably-detectable resume
-// mechanism, it is reported as unavailable — never faked.
+// mechanism, canResume() is false and resumeArgs() is null — "Native resume
+// unavailable" is shown, never faked. Agents own their history; BLITZ only
+// reads metadata (ids, mtimes) and never copies conversations.
 // ============================================================================
 
 import { existsSync, readdirSync, statSync } from 'fs';
 import { join } from 'path';
 import { spawnSync } from 'child_process';
-
-export const AGENTS = {
-  claude: { cmd: 'claude', label: 'Claude Code', nativeResume: true },
-  opencode: { cmd: 'opencode', label: 'OpenCode', nativeResume: false },
-  codex: { cmd: 'codex', label: 'Codex CLI', nativeResume: false },
-  aider: { cmd: 'aider', label: 'Aider', nativeResume: false },
-};
-
-/**
- * Detect whether a command is on PATH. Never throws.
- */
-export function detectAgent(cmd) {
-  try {
-    const finder = process.platform === 'win32' ? 'where' : 'which';
-    const r = spawnSync(finder, [cmd], { encoding: 'utf-8', timeout: 5000, windowsHide: true });
-    return r.status === 0 && (r.stdout || '').trim().length > 0;
-  } catch {
-    return false;
-  }
-}
 
 /**
  * Claude Code encodes project paths as directory names under
@@ -45,13 +30,7 @@ export function encodeClaudeProjectPath(projectDir) {
     .replace(/[^A-Za-z0-9.]+/g, '-');
 }
 
-/**
- * Discover Claude Code native sessions for a project directory.
- * @param {string} projectDir  the project's absolute path
- * @param {string} [home]      override for the user home (tests)
- * @returns {Array<{id, file, mtime}>|null}  newest first, or null when the
- *   project has no native sessions (nothing faked).
- */
+/** Discover Claude Code native session files for a project. Newest first. */
 export function claudeNativeSessions(projectDir, home) {
   try {
     const projectsDir = join(home || (process.env.USERPROFILE || process.env.HOME), '.claude', 'projects');
@@ -71,15 +50,81 @@ export function claudeNativeSessions(projectDir, home) {
   }
 }
 
-/**
- * Resume arguments for an agent, or null when native resume is unsupported.
- * - Claude Code: `--continue` resumes the most recent conversation in the
- *   project directory — the agent's own native mechanism, no history stored
- *   or duplicated by BLITZ.
- */
+// ─── Adapter interface ───────────────────────────────────────────────────────
+
+/** Build an AgentSessionAdapter for a known agent definition. */
+function makeAdapter(def) {
+  return {
+    id: def.id,
+    label: def.label,
+    command: def.cmd,
+
+    /** Installed on PATH? Never throws. */
+    detect() {
+      try {
+        const finder = process.platform === 'win32' ? 'where' : 'which';
+        const r = spawnSync(finder, [def.cmd], { encoding: 'utf-8', timeout: 5000, windowsHide: true });
+        return r.status === 0 && (r.stdout || '').trim().length > 0;
+      } catch {
+        return false;
+      }
+    },
+
+    /** Native resume: only Claude Code has a reliably-known mechanism here. */
+    canResume() {
+      return def.id === 'claude';
+    },
+
+    /**
+     * The agent's OWN session records — metadata only. Null when the agent
+     * does not store per-project sessions in a discoverable location.
+     */
+    listNativeSessions(projectDir, home) {
+      if (def.id === 'claude') return claudeNativeSessions(projectDir, home);
+      return null; // opencode/codex/aider: no reliably-detectable layout — honest null
+    },
+
+    /** Newest native session id, or null. */
+    getNativeSessionId(projectDir, home) {
+      const list = this.listNativeSessions(projectDir, home);
+      return list && list.length > 0 ? list[0].id : null;
+    },
+
+    /**
+     * Resume arguments using the agent's native mechanism, or null.
+     * Claude Code: `--continue` resumes the most recent conversation in the
+     * project directory — the agent's own history, never copied by BLITZ.
+     */
+    resumeArgs() {
+      if (def.id === 'claude') return ['--continue'];
+      return null;
+    },
+  };
+}
+
+export const agentAdapters = {
+  claude: makeAdapter({ id: 'claude', label: 'Claude Code', cmd: 'claude' }),
+  opencode: makeAdapter({ id: 'opencode', label: 'OpenCode', cmd: 'opencode' }),
+  codex: makeAdapter({ id: 'codex', label: 'Codex CLI', cmd: 'codex' }),
+  aider: makeAdapter({ id: 'aider', label: 'Aider', cmd: 'aider' }),
+};
+
+// ─── Backward-compatible helpers (thin wrappers over the adapters) ──────────
+
+export const AGENTS = Object.fromEntries(
+  Object.entries(agentAdapters).map(([id, a]) => [id, {
+    cmd: a.command,
+    label: a.label,
+    nativeResume: a.canResume(),
+  }])
+);
+
+export function detectAgent(cmd) {
+  const a = Object.values(agentAdapters).find(x => x.command === cmd);
+  return a ? a.detect() : false;
+}
+
 export function resumeArgs(agentId, projectDir) {
-  const agent = AGENTS[agentId];
-  if (!agent || !agent.nativeResume) return null;
-  if (agentId === 'claude') return ['--continue'];
-  return null;
+  const a = agentAdapters[agentId];
+  return a ? a.resumeArgs(projectDir) : null;
 }

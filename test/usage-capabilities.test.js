@@ -199,5 +199,33 @@ test('month scope aggregates only the current month', () => {
   assert.equal(u.providers[0].inputTokens, 1);
 });
 
+console.log('\nagent attribution');
+
+test('detectAgentFromUserAgent recognizes known clients, never guesses', async () => {
+  const { detectAgentFromUserAgent } = await import('../src/usage.js');
+  assert.equal(detectAgentFromUserAgent('claude-cli/1.0.44 (external, cli)'), 'Claude Code');
+  assert.equal(detectAgentFromUserAgent('claude-code/2.0'), 'Claude Code');
+  assert.equal(detectAgentFromUserAgent('opencode/0.5.2'), 'OpenCode');
+  assert.equal(detectAgentFromUserAgent('codex_cli_rs/0.1.41'), 'Codex CLI');
+  assert.equal(detectAgentFromUserAgent('aider 0.63.1'), 'Aider');
+  assert.equal(detectAgentFromUserAgent('some-random-tool/1.0'), 'other');
+  assert.equal(detectAgentFromUserAgent(''), 'unknown');
+  assert.equal(detectAgentFromUserAgent(undefined), 'unknown');
+});
+
+test('stats track usage by agent (User-Agent attribution)', () => {
+  const stats = createStats({ home: join(home, 's3'), privacy: true });
+  stats.record('nvidia', { ok: true, model: 'z-ai/glm-5.3', agent: 'Claude Code', inputTokens: 100, outputTokens: 40, contextSavedTokens: 500 });
+  stats.record('nvidia', { ok: true, model: 'z-ai/glm-5.3', agent: 'OpenCode', inputTokens: 30, outputTokens: 10 });
+  const u = stats.getUsage({ scope: 'today' });
+  const cc = u.agents.find(a => a.agent === 'Claude Code');
+  assert.equal(cc.requests, 1);
+  assert.equal(cc.inputTokens, 100);
+  assert.equal(cc.contextSavedTokens, 500);
+  const oc = u.agents.find(a => a.agent === 'OpenCode');
+  assert.equal(oc.outputTokens, 10);
+  assert.equal(u.agents.length, 2);
+});
+
 console.log(`\n${passed + failed} tests — ${passed} passed, ${failed} failed\n`);
 if (failed > 0) process.exit(1);

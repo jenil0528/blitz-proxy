@@ -16,6 +16,7 @@
 import { createServer } from 'http';
 import { appendFileSync, statSync, renameSync } from 'fs';
 import { join, dirname } from 'path';
+import { homedir } from 'os';
 import { fileURLToPath } from 'url';
 import { getConfig, getConfigRaw, refreshConfigIfChanged } from './config.js';
 import { resolveProvider, getAdapter } from './provider-registry.js';
@@ -26,7 +27,7 @@ import { withRetry } from './retry.js';
 import { resolveCredential, markCredentialRejected, markCredentialRateLimited, markCredentialHealthy } from './credentials.js';
 import { newDiscoveredIds } from './models-cache.js';
 import { optimizeContext } from './context-optimizer.js';
-import { normalizeUsage } from './usage.js';
+import { normalizeUsage, detectAgentFromUserAgent } from './usage.js';
 import { requestNeeds, requestNeedsOpenAI, estimateTokens } from './routing/capabilities.js';
 import { planCandidates, resolveActiveProvider } from './routing/router.js';
 import { classifyHttpError, classifyNetworkError } from './routing/fallback.js';
@@ -34,6 +35,7 @@ import { createHealthMonitor } from './routing/health.js';
 import { recordRequest } from './stats.js';
 import { checkAuth } from './security/auth.js';
 import { redactSecrets, maskKeyWithPrefix } from './security/mask.js';
+import { createSessionStore } from './sessions.js';
 import { DASHBOARD_HTML } from './dashboard/index.js';
 import * as log from './logger.js';
 
@@ -289,12 +291,33 @@ export function createProxyServer({ keyring, stats, token }) {
         if (path === '/admin/stats' && req.method === 'GET') {
           const rows = stats.getSummary({ scope: 'today' });
           const allRows = stats.getSummary({ scope: 'all' });
+          const usageToday = stats.getUsage({ scope: 'today' });
           sendJson(res, 200, {
             today: rows,
             allTime: allRows,
+            // Rich usage breakdown for the dashboard (never key material)
+            models: usageToday.models,
+            agents: usageToday.agents,
+            contextOptimization: cfg.contextOptimization || 'safe',
             privacy: cfg.privacy === true,
             costIsEstimate: true,
             uptimeSec: Math.round((Date.now() - startedAt) / 1000),
+          });
+          return;
+        }
+        if (path === '/admin/sessions' && req.method === 'GET') {
+          // Recovery metadata only — the registry never holds conversations
+          // or credentials. Same local file the CLI writes.
+          const store = createSessionStore({ home: process.env.BLITZ_HOME || join(homedir(), '.blitzproxy') });
+          const sessions = store.list();
+          sendJson(res, 200, {
+            sessions: sessions.map(s => ({ ...s, pid: undefined })),
+            counts: {
+              active: sessions.filter(s => s.status === 'ACTIVE').length,
+              interrupted: sessions.filter(s => s.status === 'INTERRUPTED').length,
+              completed: sessions.filter(s => s.status === 'COMPLETED').length,
+              resumable: sessions.filter(s => s.status === 'INTERRUPTED').length,
+            },
           });
           return;
         }
@@ -399,6 +422,7 @@ export function createProxyServer({ keyring, stats, token }) {
   async function handleMessages(req, res, path) {
     const reqStart = Date.now();
     const requestId = newRequestId();
+    const agentName = detectAgentFromUserAgent(req.headers['user-agent']);
     let raw;
     try {
       raw = await readBody(req);
@@ -490,7 +514,7 @@ export function createProxyServer({ keyring, stats, token }) {
             cand
           );
           const latencyMs = Date.now() - started;
-          recordRequest(stats, {
+          recordRequest(stats, { agent: agentName,
             providerId: cand.provider, model: cand.model, ok: false,
             status: response.status, latencyMs, rateLimited: cls.kind === 'rate_limit',
           });
@@ -542,12 +566,12 @@ export function createProxyServer({ keyring, stats, token }) {
           const latencyMs = Date.now() - reqStart;
           if (result.errored) {
             appendLog(`[${logTimestamp()}] ERROR stream-failed provider=${cand.provider} (${latencyMs}ms) req=${requestId}`);
-            recordRequest(stats, {
+            recordRequest(stats, { agent: agentName,
               providerId: cand.provider, model: cand.model, ok: false,
               status: 502, latencyMs,
             });
           } else {
-            recordRequest(stats, {
+            recordRequest(stats, { agent: agentName,
               providerId: cand.provider, model: cand.model, ok: true, status: 200,
               latencyMs,
               inputTokens: result.inputTokens || estTokens, outputTokens: result.outputTokens,
@@ -565,7 +589,7 @@ export function createProxyServer({ keyring, stats, token }) {
         const usage = normalizeUsage({ openai: openaiRes?.usage, estimatedInputTokens: estTokens });
         const anthropicRes = translateResponse(openaiRes, toolIdMap, anthropicReq.model || cand.model);
         const latencyMs = Date.now() - started;
-        recordRequest(stats, {
+        recordRequest(stats, { agent: agentName,
           providerId: cand.provider, model: cand.model, ok: true, status: 200,
           latencyMs,
           inputTokens: usage?.inputTokens ?? anthropicRes.usage.input_tokens,
@@ -584,7 +608,7 @@ export function createProxyServer({ keyring, stats, token }) {
       } catch (err) {
         const cls = classifyNetworkError(err);
         const latencyMs = Date.now() - started;
-        recordRequest(stats, {
+        recordRequest(stats, { agent: agentName,
           providerId: cand.provider, model: cand.model, ok: false,
           status: 502, latencyMs,
         });
@@ -612,6 +636,7 @@ export function createProxyServer({ keyring, stats, token }) {
   async function handleChatCompletions(req, res, path) {
     const reqStart = Date.now();
     const requestId = newRequestId();
+    const agentName = detectAgentFromUserAgent(req.headers['user-agent']);
     let raw;
     try {
       raw = await readBody(req);
@@ -675,7 +700,7 @@ export function createProxyServer({ keyring, stats, token }) {
             classifyHttpError(response.status, errText, { fallbackOnAuthError: cfg.fallbackOnAuthError }),
             cand
           );
-          recordRequest(stats, {
+          recordRequest(stats, { agent: agentName,
             providerId: cand.provider, model: cand.model, ok: false,
             status: response.status, latencyMs: Date.now() - started,
             rateLimited: cls.kind === 'rate_limit',
@@ -720,7 +745,7 @@ export function createProxyServer({ keyring, stats, token }) {
           }
           res.end();
           response.__blitzTimers?.clear();
-          recordRequest(stats, {
+          recordRequest(stats, { agent: agentName,
             providerId: cand.provider, model: cand.model, ok: true, status: 200,
             latencyMs: Date.now() - reqStart,
             fallbackTo: i > 0 ? plan.candidates[i - 1].provider : undefined,
@@ -736,7 +761,7 @@ export function createProxyServer({ keyring, stats, token }) {
           const parsed = JSON.parse(text);
           normUsage = normalizeUsage({ openai: parsed?.usage, estimatedInputTokens: estTokens });
         } catch { /* passthrough — no usage available */ }
-        recordRequest(stats, {
+        recordRequest(stats, { agent: agentName,
           providerId: cand.provider, model: cand.model, ok: true, status: 200,
           latencyMs: Date.now() - started,
           inputTokens: normUsage?.inputTokens, outputTokens: normUsage?.outputTokens,
@@ -752,7 +777,7 @@ export function createProxyServer({ keyring, stats, token }) {
 
       } catch (err) {
         const cls = classifyNetworkError(err);
-        recordRequest(stats, {
+        recordRequest(stats, { agent: agentName,
           providerId: cand.provider, model: cand.model, ok: false, status: 502,
           latencyMs: Date.now() - started,
         });
@@ -777,6 +802,7 @@ export function createProxyServer({ keyring, stats, token }) {
   async function handleResponses(req, res, path) {
     const reqStart = Date.now();
     const requestId = newRequestId();
+    const agentName = detectAgentFromUserAgent(req.headers['user-agent']);
     let raw;
     try {
       raw = await readBody(req);
@@ -848,7 +874,7 @@ export function createProxyServer({ keyring, stats, token }) {
             classifyHttpError(response.status, errText, { fallbackOnAuthError: cfg.fallbackOnAuthError }),
             cand
           );
-          recordRequest(stats, {
+          recordRequest(stats, { agent: agentName,
             providerId: cand.provider, model: cand.model, ok: false,
             status: response.status, latencyMs: Date.now() - started,
             rateLimited: cls.kind === 'rate_limit',
@@ -884,7 +910,7 @@ export function createProxyServer({ keyring, stats, token }) {
           const result = await translateResponsesStream(response.body, res, responsesReq.model || cand.model);
           response.__blitzTimers?.clear();
           const latencyMs = Date.now() - reqStart;
-          recordRequest(stats, {
+          recordRequest(stats, { agent: agentName,
             providerId: cand.provider, model: cand.model,
             ok: !result.errored, status: result.errored ? 502 : 200,
             latencyMs,
@@ -901,7 +927,7 @@ export function createProxyServer({ keyring, stats, token }) {
         const rUsage = normalizeUsage({ openai: openaiRes?.usage, estimatedInputTokens: estTokens });
         const out = translateResponsesResponse(openaiRes, responsesReq.model || cand.model);
         const latencyMs = Date.now() - started;
-        recordRequest(stats, {
+        recordRequest(stats, { agent: agentName,
           providerId: cand.provider, model: cand.model, ok: true, status: 200,
           latencyMs,
           inputTokens: rUsage?.inputTokens ?? out.usage.input_tokens,
@@ -917,7 +943,7 @@ export function createProxyServer({ keyring, stats, token }) {
 
       } catch (err) {
         const cls = classifyNetworkError(err);
-        recordRequest(stats, {
+        recordRequest(stats, { agent: agentName,
           providerId: cand.provider, model: cand.model, ok: false, status: 502,
           latencyMs: Date.now() - started,
         });

@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased — agent-attributed usage, request inspector, dashboard integration
+
+### Fixed — Smart rotation correctness (found by a timing-flaky test)
+- Credential ordering now puts HEALTH before activity: a failing active credential no longer outranks a healthy backup. Resolution order: eligibility tier → fewest recent failures → vault-active (ties only) → vault order. `resolveCredential` aligned with the same health-first rule.
+
+### Added — Agent-attributed usage
+- Every request is attributed to its agent via the client's User-Agent (`Claude Code` / `OpenCode` / `Codex CLI` / `Aider` / `Continue` / `Cline` / `Roo Code` — best-effort, never guessed beyond known patterns). Tracked across all normalized token dimensions.
+- `blitz usage` shows a "By agent" section; the dashboard shows a models/agents breakdown. Project/session-level attribution is honestly NOT implemented (agents do not send project identifiers over HTTP) — documented rather than faked.
+
+### Added — Request inspector
+- `blitz requests [n]` — reads the metadata-only request log and correlates per-request events (status, latency, actual model, stream flag, context savings, ROTATE/FALLBACK/CONTEXT events) by `request_id`. Nothing is shown in privacy mode.
+
+### Added — Dashboard integration
+- `/admin/stats` extended with per-model rows, per-agent rows, and the active context mode.
+- New `/admin/sessions` endpoint (token-gated; pids stripped, no key material) with active/interrupted/completed/resumable counts.
+- Dashboard gains three sections: **Usage & Context** (input/output/cached/reasoning, context saved + mode, EXACT vs ESTIMATED ratio), **Sessions**, and **Models & Agents**.
+
+### Added — Formal AgentSessionAdapter + session states
+- `src/agents.js` refactored into per-agent adapters (`detect()` / `canResume()` / `listNativeSessions()` / `getNativeSessionId()` / `resumeArgs()`); previous exports remain as wrappers. Claude Code: native sessions discovered + `--continue` resume. Others honestly report "native resume unavailable".
+- Sessions now record the **git repository root** and start in `STARTING` (→ `ACTIVE` when the OS pid attaches; dead STARTING launches become `INTERRUPTED` after a grace window).
+
+### Tests
+- 282 → **289 tests across 19 suites** — agent attribution (User-Agent detection + stats buckets + end-to-end through the gateway), adapter interface honesty, STARTING/gitRoot lifecycle, `/admin/sessions` (token-gated, pid-free, key-free).
+
 ## Unreleased — sessions & resume + vision guard
 
 ### Fixed — Vision guard (no more cryptic image errors)

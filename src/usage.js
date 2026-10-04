@@ -74,3 +74,27 @@ export function formatTokensCount(n) {
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
   return String(n);
 }
+
+// ─── Agent attribution (best-effort, from HTTP headers — never fabricated) ──
+
+const AGENT_UA_PATTERNS = [
+  [/claude-?(code|cli)/i, 'Claude Code'],
+  [/opencode/i, 'OpenCode'],
+  [/codex/i, 'Codex CLI'],
+  [/aider/i, 'Aider'],
+  [/continue/i, 'Continue'],
+  [/cline/i, 'Cline'],
+  [/roo-?code/i, 'Roo Code'],
+];
+
+/**
+ * Detect which agent is talking to the gateway from its User-Agent header.
+ * Returns a display name or 'other' — never a guess beyond these patterns.
+ */
+export function detectAgentFromUserAgent(ua) {
+  const s = String(ua || '');
+  for (const [re, name] of AGENT_UA_PATTERNS) {
+    if (re.test(s)) return name;
+  }
+  return s ? 'other' : 'unknown';
+}

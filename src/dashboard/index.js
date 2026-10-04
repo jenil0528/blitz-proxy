@@ -44,6 +44,11 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
   <div class="card"><h2>All Time (90 days)</h2><div id="alltime">—</div></div>
   <div class="card"><h2>Provider Health</h2><div id="providers">—</div></div>
 </div>
+<div class="grid" style="margin-top:16px">
+  <div class="card"><h2>Usage & Context</h2><div id="usage">—</div></div>
+  <div class="card"><h2>Sessions</h2><div id="sessions">—</div></div>
+  <div class="card"><h2>Models & Agents</h2><div id="breakdown">—</div></div>
+</div>
 <script>
 const TOKEN = new URLSearchParams(location.search).get('token') || '';
 async function getJson(path) {
@@ -93,6 +98,58 @@ async function refresh() {
     document.getElementById('alltime').innerHTML = table(
       ['Provider', 'Req', 'OK', 'Fail', 'RL', 'Avg lat', 'In tok', 'Out tok', 'Est cost'],
       statRows(stats.allTime));
+
+    // ── Usage & Context (normalized token accounting — EXACT vs ESTIMATED) ──
+    const tok = (a, k) => fmt(a && a[k]);
+    const todayUsage = (stats.today || []).reduce((acc, r) => ({
+      in: acc.in + (r.inputTokens || 0), out: acc.out + (r.outputTokens || 0),
+      cached: acc.cached + (r.cachedTokens || 0), reason: acc.reason + (r.reasoningTokens || 0),
+      ctxSaved: acc.ctxSaved + (r.contextSavedTokens || 0),
+      est: acc.est + (r.estimatedRequests || 0), req: acc.req + r.requests,
+    }), { in: 0, out: 0, cached: 0, reason: 0, ctxSaved: 0, est: 0, req: 0 });
+    const exactPct = todayUsage.req > 0 ? Math.round(((todayUsage.req - todayUsage.est) / todayUsage.req) * 100) : 100;
+    document.getElementById('usage').innerHTML =
+      '<table>' +
+      '<tr><th>Input</th><td>' + fmt(todayUsage.in) + '</td><th>Output</th><td>' + fmt(todayUsage.out) + '</td></tr>' +
+      '<tr><th>Cached</th><td>' + fmt(todayUsage.cached) + '</td><th>Reasoning</th><td>' + fmt(todayUsage.reason) + '</td></tr>' +
+      '<tr><th>Context saved</th><td>' + fmt(todayUsage.ctxSaved) + '</td><th>Context mode</th><td>' + esc(stats.contextOptimization || 'safe') + '</td></tr>' +
+      '<tr><th>Usage source</th><td colspan="3"><span class="ok">' + exactPct + '% EXACT</span>' +
+      (todayUsage.est ? ' <span class="dim">+ ' + todayUsage.est + ' ESTIMATED</span>' : '') + '</td></tr>' +
+      '</table>';
+
+    // ── Sessions (recovery metadata only) ──
+    let sessionsHtml = '<div class="dim">no sessions recorded</div>';
+    try {
+      const sess = await getJson('/admin/sessions');
+      if (sess.counts) {
+        sessionsHtml =
+          '<div style="margin-bottom:8px">' +
+          '<span class="pill online">' + sess.counts.active + ' active</span> ' +
+          '<span class="pill offline">' + sess.counts.interrupted + ' interrupted</span> ' +
+          '<span class="pill unknown">' + sess.counts.completed + ' completed</span></div>' +
+          table(
+            ['Project', 'Agent', 'Model', 'Status'],
+            (sess.sessions || []).slice(0, 8).map(s => [
+              esc(s.projectName || '—'), esc(s.agent || '—'), esc(s.model || '—'),
+              '<span class="pill ' + (s.status === 'ACTIVE' ? 'online' : s.status === 'INTERRUPTED' ? 'offline' : 'unknown') + '">' + esc(s.status) + '</span>',
+            ]));
+      }
+    } catch (e) {
+      sessionsHtml = '<div class="dim">' + esc(e.message) + '</div>';
+    }
+    document.getElementById('sessions').innerHTML = sessionsHtml;
+
+    // ── By model / by agent breakdown ──
+    const bdRows = [];
+    for (const m of (stats.models || []).slice(0, 6)) {
+      bdRows.push(['<span class="pill unknown">model</span> ' + esc(m.model), fmt(m.requests), fmt((m.inputTokens || 0) + (m.outputTokens || 0)), fmt(m.contextSavedTokens)]);
+    }
+    for (const a of (stats.agents || []).filter(a => a.agent !== 'unknown').slice(0, 6)) {
+      bdRows.push(['<span class="pill degraded">agent</span> ' + esc(a.agent), fmt(a.requests), fmt((a.inputTokens || 0) + (a.outputTokens || 0)), fmt(a.contextSavedTokens)]);
+    }
+    document.getElementById('breakdown').innerHTML = bdRows.length
+      ? table(['Dimension', 'Req', 'Tokens', 'Ctx saved'], bdRows)
+      : '<div class="dim">no data</div>';
   } catch (err) {
     document.getElementById('status').innerHTML = '<span class="err">failed to load: ' + esc(err.message) + '</span>';
   }

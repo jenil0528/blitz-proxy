@@ -437,6 +437,29 @@ await test('images sent to a vision-less model produce a clear 400 with a fix â€
   }
 });
 
+await test('usage is attributed to the agent (User-Agent â†’ stats)', async () => {
+  const res = await post('/v1/messages', anthropicReq(), { 'User-Agent': 'claude-cli/1.0.44 (external, cli)' });
+  assert.equal(res.status, 200);
+  const u = stats.getUsage({ scope: 'today' });
+  const cc = u.agents.find(a => a.agent === 'Claude Code');
+  assert.ok(cc, 'the request is attributed to Claude Code');
+  assert.equal(cc.requests >= 1, true);
+});
+
+await test('/admin/sessions returns recovery metadata with counts (token-gated)', async () => {
+  const denied = await fetch(baseUrl + '/admin/sessions');
+  assert.equal(denied.status, 401, 'admin endpoints always require the token');
+  const res = await fetch(baseUrl + `/admin/sessions?token=${token}`);
+  assert.equal(res.status, 200);
+  const data = await res.json();
+  assert.ok(Array.isArray(data.sessions));
+  assert.ok(data.counts && typeof data.counts.active === 'number');
+  for (const s of data.sessions) {
+    assert.equal(s.pid, undefined, 'process ids are never exposed over HTTP');
+    assert.ok(!JSON.stringify(s).includes('nvapi-'), 'no key material ever');
+  }
+});
+
 await test('GET /v1/models includes discovered models for the active provider', async () => {
   try {
     saveConfig({ discoveredModels: { mocka: { models: [{ id: 'mock/discovered-x', lastSeen: 'now' }], fetchedAt: 'now' } } });

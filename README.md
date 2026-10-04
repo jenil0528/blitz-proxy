@@ -1,4 +1,4 @@
-![version](https://img.shields.io/badge/version-2.0.0-blue) ![node](https://img.shields.io/badge/node-18%2B-green) ![zero deps](https://img.shields.io/badge/dependencies-zero-brightgreen) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Mac%20%7C%20Linux-lightgrey) ![tests](https://img.shields.io/badge/tests-282%20passed%20%2F%2019%20suites-brightgreen) ![CI](https://github.com/jenil0528/blitz-proxy/actions/workflows/ci.yml/badge.svg)
+![version](https://img.shields.io/badge/version-2.0.0-blue) ![node](https://img.shields.io/badge/node-18%2B-green) ![zero deps](https://img.shields.io/badge/dependencies-zero-brightgreen) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Mac%20%7C%20Linux-lightgrey) ![tests](https://img.shields.io/badge/tests-289%20passed%20%2F%2019%20suites-brightgreen) ![CI](https://github.com/jenil0528/blitz-proxy/actions/workflows/ci.yml/badge.svg)
 
 # ⚡ BlitzProxy
 
@@ -335,7 +335,9 @@ blitz usage month  #   EXACT vs ESTIMATED clearly separated, per-model breakdown
 blitz logs --live  # tail the request log (routes, statuses, latency — never prompts)
 ```
 
-Providers do not return identical usage fields — BLITZ normalizes everything into one internal format (`src/usage.js`) and **estimates are always labeled ESTIMATED**, never presented as exact provider usage. Optimizer savings are tracked as `context saved` tokens.
+Providers do not return identical usage fields — BLITZ normalizes everything into one internal format (`src/usage.js`) and **estimates are always labeled ESTIMATED**, never presented as exact provider usage. Optimizer savings are tracked as `context saved` tokens. Requests are also **attributed to the agent** via its User-Agent (Claude Code / OpenCode / Codex / Aider — best-effort, shown in `blitz usage` and the dashboard).
+
+`blitz requests` inspects the recent request log — status, latency, actual model, stream flag, context savings, rotation/fallback events — all correlated by `request_id` (nothing in privacy mode, never prompts).
 ```
 
 The dashboard is local-only, token-gated, and built with zero frontend dependencies: provider health, current routing, request counts, errors, fallback and rotation events, and clearly-labeled **pricing estimates** (unknown pricing shows `n/a` — never invented). Stats are aggregates only: prompts and responses are never stored.
@@ -437,7 +439,7 @@ blitz config set proxyPort 4818
 ## Development
 
 ```bash
-npm test            # 282 tests, 19 suites — mocked providers behind real HTTP servers, no real keys
+npm test            # 289 tests, 19 suites — mocked providers behind real HTTP servers, no real keys
 npm run lint        # syntax check over all sources
 npm run dev         # watch-mode server
 npm run test:live   # OPT-IN live tests — set BLITZ_LIVE_TESTS=1 first; uses your real provider
@@ -453,7 +455,7 @@ Live tests (Anthropic + OpenAI + Responses endpoints, streaming, tool calls, rea
 | Credentials | `blitz add` · `credentials` · `switch` · `rm` · `validate` |
 | Models | `blitz model` · `models` · `models refresh` · `use <provider/model>` · `alias` |
 | Routing | `blitz provider` · `auto` · `fallback` · `profile` · `config set fallbackMode strict` · `config set contextOptimization safe` |
-| Insight & safety | `blitz health` · `stats` · `usage` · `logs` · `dashboard` · `doctor` · `config validate` · `compatibility` · `context` · `config` · `privacy` · `token` |
+| Insight & safety | `blitz health` · `stats` · `usage` · `requests` · `logs` · `dashboard` · `doctor` · `config validate` · `compatibility` · `context` · `config` · `privacy` · `token` |
 
 ## License
 

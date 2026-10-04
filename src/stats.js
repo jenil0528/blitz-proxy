@@ -54,11 +54,23 @@ export function createStats({ home, privacy = false }) {
       inputTokens: 0, outputTokens: 0,
       cachedTokens: 0, reasoningTokens: 0, contextSavedTokens: 0, estimatedRequests: 0,
       models: {},
+      agents: {},
       latencyMsSum: 0, latencyCount: 0,
       costUsd: 0, costCount: 0,
     };
     day[providerId] = b;
     return b;
+  }
+
+  function agentBucket(b, agent) {
+    if (!agent) return null;
+    const a = b.agents[agent] || {
+      requests: 0, ok: 0, fail: 0,
+      inputTokens: 0, outputTokens: 0,
+      cachedTokens: 0, reasoningTokens: 0, contextSavedTokens: 0, estimatedRequests: 0,
+    };
+    b.agents[agent] = a;
+    return a;
   }
 
   function modelBucket(b, model) {
@@ -108,6 +120,21 @@ export function createStats({ home, privacy = false }) {
         }
       }
     }
+    // Per-agent bucket (attribution from the client's User-Agent — best-effort)
+    if (evt.agent) {
+      const a = agentBucket(b, evt.agent);
+      if (a) {
+        a.requests += 1;
+        if (evt.ok) a.ok += 1; else a.fail += 1;
+        if (evt.inputTokens) a.inputTokens += evt.inputTokens;
+        if (evt.outputTokens) a.outputTokens += evt.outputTokens;
+        if (evt.cachedTokens) a.cachedTokens = (a.cachedTokens || 0) + evt.cachedTokens;
+        if (evt.reasoningTokens) a.reasoningTokens = (a.reasoningTokens || 0) + evt.reasoningTokens;
+        if (evt.contextSavedTokens) a.contextSavedTokens = (a.contextSavedTokens || 0) + evt.contextSavedTokens;
+        if (evt.estimated) a.estimatedRequests = (a.estimatedRequests || 0) + 1;
+      }
+    }
+
     // A computed $0 estimate is valid (free tier) and must not be confused
     // with "pricing unknown" — tracked via costCount.
     if (typeof evt.costUsd === 'number') {
@@ -155,6 +182,7 @@ export function createStats({ home, privacy = false }) {
           inputTokens: 0, outputTokens: 0,
           cachedTokens: 0, reasoningTokens: 0, contextSavedTokens: 0, estimatedRequests: 0,
           models: {},
+          agents: {},
           latencyMsSum: 0, latencyCount: 0, costUsd: 0, costCount: 0,
         };
         agg.requests += b.requests || 0;
@@ -192,6 +220,23 @@ export function createStats({ home, privacy = false }) {
           mm.latencyMsSum += m.latencyMsSum || 0;
           mm.latencyCount += m.latencyCount || 0;
         }
+        // merge per-agent buckets across days
+        for (const [agent, a] of Object.entries(b.agents || {})) {
+          const aa = agg.agents[agent] || (agg.agents[agent] = {
+            requests: 0, ok: 0, fail: 0,
+            inputTokens: 0, outputTokens: 0,
+            cachedTokens: 0, reasoningTokens: 0, contextSavedTokens: 0, estimatedRequests: 0,
+          });
+          aa.requests += a.requests || 0;
+          aa.ok += a.ok || 0;
+          aa.fail += a.fail || 0;
+          aa.inputTokens += a.inputTokens || 0;
+          aa.outputTokens += a.outputTokens || 0;
+          aa.cachedTokens += a.cachedTokens || 0;
+          aa.reasoningTokens += a.reasoningTokens || 0;
+          aa.contextSavedTokens += a.contextSavedTokens || 0;
+          aa.estimatedRequests += a.estimatedRequests || 0;
+        }
         out.set(providerId, agg);
       }
     }
@@ -207,7 +252,8 @@ export function createStats({ home, privacy = false }) {
   }
 
   /**
-   * Rich usage summary: provider rows + per-model rows (model across providers).
+   * Rich usage summary: provider rows + per-model rows (model across
+   * providers) + per-agent rows (User-Agent attribution, best-effort).
    * New token dimensions: cachedTokens, reasoningTokens, contextSavedTokens,
    * estimatedRequests (estimates never counted as exact).
    */
@@ -215,6 +261,7 @@ export function createStats({ home, privacy = false }) {
     const providers = summarize(scope === 'all' ? 'all' : scope === 'month' ? 'month' : 1);
     const rows = [];
     const models = new Map();
+    const agents = new Map();
     for (const [providerId, b] of providers) {
       rows.push({
         providerId,
@@ -252,9 +299,33 @@ export function createStats({ home, privacy = false }) {
         mm.contextSavedTokens += m.contextSavedTokens;
         mm.estimatedRequests += m.estimatedRequests;
       }
+      for (const [agent, a] of Object.entries(b.agents || {})) {
+        let aa = agents.get(agent);
+        if (!aa) {
+          aa = {
+            agent, requests: 0, ok: 0, fail: 0,
+            inputTokens: 0, outputTokens: 0,
+            cachedTokens: 0, reasoningTokens: 0, contextSavedTokens: 0, estimatedRequests: 0,
+          };
+          agents.set(agent, aa);
+        }
+        aa.requests += a.requests;
+        aa.ok += a.ok;
+        aa.fail += a.fail;
+        aa.inputTokens += a.inputTokens;
+        aa.outputTokens += a.outputTokens;
+        aa.cachedTokens += a.cachedTokens;
+        aa.reasoningTokens += a.reasoningTokens;
+        aa.contextSavedTokens += a.contextSavedTokens;
+        aa.estimatedRequests += a.estimatedRequests;
+      }
     }
     rows.sort((a, b2) => b2.requests - a.requests);
-    return { providers: rows, models: [...models.values()].sort((a, b2) => b2.requests - a.requests) };
+    return {
+      providers: rows,
+      models: [...models.values()].sort((a, b2) => b2.requests - a.requests),
+      agents: [...agents.values()].sort((a, b2) => b2.requests - a.requests),
+    };
   }
 
   function clear() {
@@ -271,11 +342,12 @@ export function createStats({ home, privacy = false }) {
  * New optional fields flow through to the new token dimensions:
  * cachedTokens, reasoningTokens, estimated, contextSavedTokens.
  */
-export function recordRequest(stats, { providerId, model, ok, status, latencyMs, inputTokens, outputTokens, cachedTokens, reasoningTokens, estimated, contextSavedTokens, rateLimited, fallbackTo }) {
+export function recordRequest(stats, { providerId, model, agent, ok, status, latencyMs, inputTokens, outputTokens, cachedTokens, reasoningTokens, estimated, contextSavedTokens, rateLimited, fallbackTo }) {
   const cost = ok ? estimateRequestCost(providerId, model, inputTokens || 0, outputTokens || 0) : null;
   stats.record(providerId, {
     ok,
     model,
+    agent,
     rateLimited: rateLimited === true,
     latencyMs,
     inputTokens: inputTokens || 0,

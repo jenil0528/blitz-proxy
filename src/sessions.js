@@ -29,6 +29,8 @@ function isPidAlive(pid) {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
+const STARTING_GRACE_MS = 5 * 60 * 1000; // STARTING sessions without a pid this old → INTERRUPTED
+
 export function createSessionStore({ home, retentionDays = 30 } = {}) {
   const filePath = join(home || '.', FILE);
   let data = { version: 1, sessions: [] };
@@ -51,31 +53,42 @@ export function createSessionStore({ home, retentionDays = 30 } = {}) {
   }
 
   /**
-   * Mark ACTIVE sessions whose process no longer exists as INTERRUPTED —
-   * abnormal termination (crash, killed terminal, reboot) detection.
+   * Mark sessions whose process no longer exists as INTERRUPTED — abnormal
+   * termination (crash, killed terminal, reboot) detection. STARTING
+   * sessions that never received a pid within the grace window are treated
+   * the same way (the launch died before the process existed).
    */
   function pruneDead() {
     let changed = false;
+    const now = Date.now();
     for (const s of data.sessions) {
       if (s.status === 'ACTIVE' && !isPidAlive(s.pid)) {
         s.status = 'INTERRUPTED';
         delete s.pid;
         changed = true;
+      } else if (s.status === 'STARTING' && !isPidAlive(s.pid)) {
+        const age = now - Date.parse(s.startedAt || 0);
+        if (age > STARTING_GRACE_MS) {
+          s.status = 'INTERRUPTED';
+          delete s.pid;
+          changed = true;
+        }
       }
     }
     if (changed) persist();
     return changed;
   }
 
-  function create({ agent, projectDir, projectName, gitBranch, pid, model, profile, provider }) {
+  function create({ agent, projectDir, projectName, gitRoot, gitBranch, pid, model, profile, provider }) {
     const session = {
       id: newId(),
       agent: agent || 'unknown',
       projectDir: projectDir || '',
       projectName: projectName || (projectDir ? basename(projectDir) : '—'),
+      gitRoot: gitRoot || '',
       gitBranch: gitBranch || '',
       pid: pid || null,
-      status: 'ACTIVE',
+      status: 'STARTING', // → ACTIVE once the OS pid is attached
       startedAt: new Date().toISOString(),
       lastActivity: new Date().toISOString(),
       model: model || '',

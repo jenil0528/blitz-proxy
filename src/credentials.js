@@ -115,14 +115,14 @@ function tier(credentialId) {
 }
 
 /**
- * Resolve ONE credential for a provider.
- * Priority:
- *   1. explicitly requested credential id (when it belongs to the provider)
- *   2. the vault's active key, when it belongs to this provider and is eligible
- *   3. the healthiest eligible credential
- *   4. any remaining credential (keys recover upstream)
- * Returns the full keyring entry { id, name, key, provider, ... } or null.
- */
+  * Resolve ONE credential for a provider.
+  * Priority:
+  *   1. explicitly requested credential id (when it belongs to the provider)
+  *   2. the healthiest eligible credential — the vault-active key wins only
+  *      among equally healthy ones (failure-count ties)
+  *   3. cooldown/invalid-held tiers as a last resort (keys recover upstream)
+  * Returns the full keyring entry { id, name, key, provider, ... } or null.
+  */
 export async function resolveCredential({ keyring, providerId, credentialId }) {
   if (!providerId) return null;
 
@@ -132,24 +132,17 @@ export async function resolveCredential({ keyring, providerId, credentialId }) {
     // A mismatched or unknown id falls through to the normal priority order.
   }
 
+  // 2./3. resolver ordering already tiers by health; active breaks ties.
   const ordered = await resolveCredentials({ keyring, providerId });
   if (ordered.length === 0) return null;
-
-  // 2. vault-active credential when eligible
-  const active = await keyring.getActiveKey();
-  if (active && active.provider === providerId && tier(active.id) === 0) {
-    const match = ordered.find(c => c.id === active.id);
-    if (match) return match;
-  }
-
-  // 3./4. resolver ordering already tiers: healthy → cooldown → invalid
   return ordered[0];
 }
 
 /**
- * Ordered credentials for a provider (rotation order), deterministic:
- *   active (when eligible) → eligible by fewest failures, vault order →
- *   cooldown → invalid hold.
+ * Ordered credentials for a provider (rotation order), deterministic and
+ * health-first: eligible credentials by fewest recent failures first —
+ * the vault-active credential only breaks ties among equally healthy ones —
+ * then rate-limit-cooled, then invalid-held.
  * Never returns an empty array when credentials exist.
  */
 export async function resolveCredentials({ keyring, providerId }) {
@@ -171,8 +164,8 @@ export async function resolveCredentials({ keyring, providerId }) {
   });
   scored.sort((a, b) =>
     (a.t - b.t) ||
-    (b.isActive - a.isActive) ||
-    (a.failures - b.failures) ||
+    (a.failures - b.failures) ||        // health outranks activity — smart rotation
+    (b.isActive - a.isActive) ||        // active wins only among equally healthy
     (a.idx - b.idx)
   );
 
@@ -184,3 +177,4 @@ export async function resolveCredentials({ keyring, providerId }) {
 
   return scored.map(s => s.cred);
 }
+
