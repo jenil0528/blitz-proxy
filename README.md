@@ -313,13 +313,9 @@ blitz context unlock                #   until you unlock
 
 ### Vision guard (no more confusing image errors)
 
-A request containing images is **never sent to a model that is known not to support image input** — that combination is what produced cryptic `Cannot read "image.png"` failures and garbled output. Instead you get an immediate, actionable error:
+A request containing images is **never sent to a model that is known not to support image input** — that combination is what produced cryptic `Cannot read "image.png"` failures and garbled output. Instead you get an immediate, actionable error naming the model and the fix (`blitz use <vision-model>`, or `blitz auto` which picks the vision-capable model for image requests automatically).
 
-```
-This request contains image input, but the selected model nvidia/z-ai/glm-5.3
-does not support images. Switch to a vision-capable model: blitz use <model>
-(or add it as a fallback: blitz fallback add <provider>)
-```
+There is also a **client-side half of this problem**: Claude Code decides whether it may read images from the model *name* it is configured with — an unknown id like `z-ai/glm-5.3` makes it refuse before the request ever reaches BLITZ. BLITZ therefore launches Claude Code with a model name it understands (`claude-sonnet-4-20250514` by default, configurable via `blitz config set clientModel <claude-model>`), while routing to your real active model regardless — clients never need to know the backend model.
 
 Models with unknown vision capabilities are never rejected on a guess — only verified catalog metadata triggers the guard.
 
@@ -427,6 +423,7 @@ Drop it in `providers/`, restart, done. Full guide: [PROVIDERS.md](PROVIDERS.md)
 | `PROXY_PORT` / `BLITZ_HOST` | override port / bind host |
 | `TIMEOUT` | override provider timeouts |
 | `PRIVACY=true` | same as `blitz privacy` |
+| `clientModel` | the model NAME clients see (`claude-*`); keeps Claude Code's image reading working with non-claude backends |
 
 Common settings:
 

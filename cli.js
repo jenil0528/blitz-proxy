@@ -26,7 +26,7 @@ import { mergeDiscovered, discoveredList } from './src/models-cache.js';
 import { resolveAlias, listAliases, validateAliasValue, ALIAS_RE } from './src/aliases.js';
 import { CONTEXT_MODES } from './src/context-optimizer.js';
 import { getCapabilities, capabilityMark, capabilityLabel, formatTokens } from './src/model-capabilities.js';
-import { AGENTS, claudeNativeSessions, resumeArgs } from './src/agents.js';
+import { AGENTS, claudeNativeSessions, resumeArgs, claudeClientModel } from './src/agents.js';
 import { createSessionStore } from './src/sessions.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -584,18 +584,16 @@ function blitzEnv(cfg, token) {
   const url = serverUrl(cfg);
   return {
     ...process.env,
-    // Anthropic clients (Claude Code)
+    // Anthropic clients (Claude Code). The client sees a model name it
+    // understands (client-side capability decisions like image reading are
+    // made from the NAME); BLITZ routes to the active backend model.
     ANTHROPIC_BASE_URL: url,
     ANTHROPIC_API_KEY: token,
-    ANTHROPIC_MODEL: activeModelOrEmpty(cfg),
+    ANTHROPIC_MODEL: claudeClientModel(cfg),
     // OpenAI clients (Codex CLI, OpenCode, Aider, Continue, …)
     OPENAI_BASE_URL: `${url}/v1`,
     OPENAI_API_KEY: token,
   };
-}
-
-function activeModelOrEmpty(cfg) {
-  return cfg.model || '';
 }
 
 async function cmdRun(args) {

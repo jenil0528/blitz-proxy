@@ -57,6 +57,7 @@ export const DEFAULT_CONFIG = {
   contextCustom: {},            // per-operation flags for custom mode
   contextLock: false,           // when true, only `blitz context unlock` allows mode changes
   sessionRetentionDays: 30,     // recovery metadata retention; 0 = keep forever
+  clientModel: '',             // model NAME clients see (claude-*); default: a known vision-capable alias
   proxyPort: 4819,
   host: '127.0.0.1',             // local-first; never 0.0.0.0 by default
   requireAuth: false,            // token required for /v1/* (admin always requires it)

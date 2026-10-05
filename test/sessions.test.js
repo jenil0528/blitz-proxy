@@ -132,6 +132,30 @@ test('resumeArgs: claude uses its own --continue; others honestly unsupported', 
   assert.equal(resumeArgs('nosuch', '/x'), null);
 });
 
+console.log('\nclaude client model (image-read fix)');
+
+test('claudeClientModel: backend ids become names Claude Code understands', async () => {
+  const { claudeClientModel } = await import('../src/agents.js');
+  // backend model id → a known vision-capable alias (the client decides
+  // image support from the NAME; BLITZ routes to the backend regardless)
+  assert.equal(claudeClientModel({ model: 'z-ai/glm-5.3' }), 'claude-sonnet-4-20250514');
+  assert.equal(claudeClientModel({ model: '' }), 'claude-sonnet-4-20250514');
+  // claude-* ids pass through untouched
+  assert.equal(claudeClientModel({ model: 'claude-3-5-sonnet-20241022' }), 'claude-3-5-sonnet-20241022');
+  // explicit user override wins
+  assert.equal(claudeClientModel({ model: 'z-ai/glm-5.3', clientModel: 'claude-3-haiku-20240307' }), 'claude-3-haiku-20240307');
+});
+
+test('projectName derivation is separator-agnostic (CI fix: POSIX basename does not split backslashes)', () => {
+  const store = createSessionStore({ home: join(home, 's9') });
+  const a = store.create({ agent: 'claude', projectDir: 'J:\\proj\\demo' });
+  const b = store.create({ agent: 'claude', projectDir: '/home/runner/work/demo' });
+  assert.equal(a.projectName, 'demo', 'Windows-style path, any platform');
+  assert.equal(b.projectName, 'demo', 'POSIX-style path, any platform');
+  const c = store.create({ agent: 'claude', projectDir: 'demo' });
+  assert.equal(c.projectName, 'demo', 'bare name');
+});
+
 test('encodeClaudeProjectPath collapses path characters', () => {
   const enc = encodeClaudeProjectPath('C:\\Users\\jenil\\Projects\\my app');
   assert.ok(!enc.includes('\\') && !enc.includes(':'), 'special chars collapsed: ' + enc);

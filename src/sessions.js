@@ -15,10 +15,22 @@
 // ============================================================================
 
 import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from 'fs';
-import { join, basename } from 'path';
+import { join } from 'path';
 import { randomBytes } from 'crypto';
 
 const FILE = 'sessions.json';
+
+/**
+ * Basename that handles BOTH separators. Session metadata may carry
+ * Windows-style paths (backslashes) regardless of the platform reading it —
+ * POSIX basename() does not split on backslashes. (This exact mismatch was
+ * the CI failure on ubuntu/macos.)
+ */
+function baseNameAny(p) {
+  const s = String(p || '').replace(/[\\/]+$/, '');
+  const idx = Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\'));
+  return idx === -1 ? s : s.slice(idx + 1);
+}
 
 function newId() {
   return 'B-' + randomBytes(4).toString('hex').toUpperCase();
@@ -84,7 +96,7 @@ export function createSessionStore({ home, retentionDays = 30 } = {}) {
       id: newId(),
       agent: agent || 'unknown',
       projectDir: projectDir || '',
-      projectName: projectName || (projectDir ? basename(projectDir) : '—'),
+      projectName: projectName || (projectDir ? baseNameAny(projectDir) : '—'),
       gitRoot: gitRoot || '',
       gitBranch: gitBranch || '',
       pid: pid || null,

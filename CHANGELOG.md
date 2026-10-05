@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased — CI green + the client-side half of the image fix
+
+### Fixed — CI was failing on ubuntu/macos (since the gateway-evolution commits)
+- Session `projectName` used POSIX `basename()`, which does not split Windows-style backslash paths — the sessions test failed on every Linux/macOS job. Derivation is now separator-agnostic (`baseNameAny`), correct for real metadata too (foreign-style paths in the registry). Verified: the previously failing assertion is covered on both separator styles.
+- Historical note: earlier red CI runs also included one-off flakes (e.g. a single Windows job); the only deterministic POSIX failure was this one.
+
+### Fixed — Claude Code image reading (the client-side half)
+- Root cause of the remaining `Cannot read "image.png"` errors: Claude Code decides image support from the model NAME in `ANTHROPIC_MODEL` — an unknown backend id (`z-ai/glm-5.3`) made it refuse to read images before the request ever reached the gateway.
+- `blitzEnv` now launches Claude Code with `claudeClientModel(cfg)`: an explicit `clientModel` config, a passthrough for `claude-*` ids, or the known vision-capable alias `claude-sonnet-4-20250514`. BLITZ routes to the real active model regardless — clients never need to know the backend.
+- Corrected the vision-guard suggestion for same-provider cases: the active provider is deduped from the fallback chain, so the actionable fixes are now `blitz use <vision-model>` or `blitz auto` (capability routing picks the vision model for image requests).
+
+### Tests
+- 289 → **291 tests across 19 suites** — `claudeClientModel` mapping (alias/passthrough/override), separator-agnostic project names (the exact CI failure, covered on both platforms' path styles).
+
 ## Unreleased — agent-attributed usage, request inspector, dashboard integration
 
 ### Fixed — Smart rotation correctness (found by a timing-flaky test)

@@ -303,9 +303,17 @@ export async function planCandidates({ cfg, keyring, needs, estTokens, health })
         if (suggestions.length >= 2) break;
       }
       const active = candidates[0];
-      const fix = suggestions.length > 0
-        ? `Switch to a vision-capable model: blitz use ${suggestions[0]}  (or add it as a fallback: blitz fallback add ${suggestions[0].split('/')[0]})`
-        : `No vision-capable model is configured for your providers — configure one that supports image input.`;
+      const [suggestionProvider] = suggestions[0] ? suggestions[0].split('/') : [];
+      let fix;
+      if (suggestions.length === 0) {
+        fix = `No vision-capable model is configured for your providers — configure one that supports image input.`;
+      } else if (suggestionProvider === active.provider) {
+        // The active provider IS deduped from the fallback chain — switching
+        // the model or letting capability routing pick is the real fix.
+        fix = `Switch with: blitz use ${suggestions[0]} — or enable capability routing: blitz auto (picks the vision model for image requests).`;
+      } else {
+        fix = `Switch to a vision-capable model: blitz use ${suggestions[0]}  (or add it as a fallback: blitz fallback add ${suggestionProvider})`;
+      }
       return {
         candidates: [],
         warnings,

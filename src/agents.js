@@ -109,6 +109,25 @@ export const agentAdapters = {
   aider: makeAdapter({ id: 'aider', label: 'Aider', cmd: 'aider' }),
 };
 
+/**
+ * The model NAME Claude Code should see. Claude Code makes client-side
+ * capability decisions (image reading, etc.) from the model name it is
+ * configured with — a backend id like "z-ai/glm-5.3" is unknown to it and
+ * makes it refuse to read images ("this model does not support image input")
+ * before the request ever reaches the gateway. BLITZ routes to the active
+ * backend model regardless of the client's display name, so the client gets
+ * a name it understands:
+ *   1. explicit cfg.clientModel (blitz config set clientModel <name>)
+ *   2. the active model itself when it is already a claude-* id
+ *   3. a known vision-capable claude alias otherwise
+ */
+export function claudeClientModel(cfg = {}) {
+  if (cfg.clientModel) return cfg.clientModel;
+  const active = String(cfg.model || '');
+  if (active.startsWith('claude-')) return active;
+  return 'claude-sonnet-4-20250514';
+}
+
 // ─── Backward-compatible helpers (thin wrappers over the adapters) ──────────
 
 export const AGENTS = Object.fromEntries(
