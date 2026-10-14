@@ -378,6 +378,143 @@ test('reasoning_content becomes a thinking block before text', () => {
   assert.equal(result.stop_reason, 'end_turn');
 });
 
+// ─── Extended thinking → provider reasoning control (2.1) ─────────────────────
+
+console.log('\nthinking → reasoning control');
+
+test('thinking budget → OpenRouter reasoning {effort, max_tokens} when declared', () => {
+  const { body } = translateRequest({
+    thinking: { type: 'enabled', budget_tokens: 5000 },
+    messages: [{ role: 'user', content: 'hi' }],
+  }, 'm', { reasoningControl: 'openrouter-reasoning' });
+  assert.equal(body.reasoning.effort, 'medium', '5000 tokens → medium');
+  assert.equal(body.reasoning.max_tokens, 5000);
+});
+
+test('thinking budget buckets: low / medium / high', () => {
+  const mk = (budget) => translateRequest(
+    { thinking: { type: 'enabled', budget_tokens: budget }, messages: [{ role: 'user', content: 'x' }] },
+    'm', { reasoningControl: 'openrouter-reasoning' }
+  ).body.reasoning.effort;
+  assert.equal(mk(2000), 'low');
+  assert.equal(mk(9000), 'medium');
+  assert.equal(mk(30000), 'high');
+  assert.equal(mk(undefined), 'medium', 'no budget → medium');
+});
+
+test('thinking → reasoning_effort style when declared', () => {
+  const { body } = translateRequest({
+    thinking: { type: 'enabled', budget_tokens: 30000 },
+    messages: [{ role: 'user', content: 'x' }],
+  }, 'm', { reasoningControl: 'reasoning-effort' });
+  assert.equal(body.reasoning_effort, 'high');
+  assert.equal(body.reasoning, undefined);
+});
+
+test('thinking → GLM thinking style when declared', () => {
+  const { body } = translateRequest({
+    thinking: { type: 'enabled', budget_tokens: 8000 },
+    messages: [{ role: 'user', content: 'x' }],
+  }, 'm', { reasoningControl: 'glm-thinking' });
+  assert.deepEqual(body.thinking, { type: 'enabled' }, 'budget dropped (unsupported)');
+});
+
+test('thinking with NO declared control → dropped, never sent speculatively', () => {
+  const { body } = translateRequest({
+    thinking: { type: 'enabled', budget_tokens: 8000 },
+    messages: [{ role: 'user', content: 'x' }],
+  }, 'm', {});
+  assert.equal(body.reasoning, undefined);
+  assert.equal(body.reasoning_effort, undefined);
+  assert.equal(body.thinking, undefined);
+});
+
+// ─── Prompt-caching passthrough (2.1) ────────────────────────────────────────
+
+console.log('\ncache_control passthrough');
+
+test('cache_control kept on user text parts when the provider declares caching', () => {
+  const { body } = translateRequest({
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'part one' },
+        { type: 'text', text: 'part two', cache_control: { type: 'ephemeral' } },
+      ],
+    }],
+  }, 'm', { promptCaching: 'anthropic-ephemeral' });
+  const userMsg = body.messages[0];
+  assert.ok(Array.isArray(userMsg.content), 'breakpoints need parts, not a joined string');
+  assert.equal(userMsg.content[0].text, 'part one');
+  assert.equal(userMsg.content[0].cache_control, undefined, 'no marker on the first part');
+  assert.deepEqual(userMsg.content[1].cache_control, { type: 'ephemeral' });
+});
+
+test('cache_control stripped when the provider does NOT declare caching', () => {
+  const { body } = translateRequest({
+    messages: [{
+      role: 'user',
+      content: [{ type: 'text', text: 'hello', cache_control: { type: 'ephemeral' } }],
+    }],
+  }, 'm', {});
+  assert.equal(body.messages[0].content, 'hello', 'plain string, no parts');
+  assert.equal(JSON.stringify(body).includes('cache_control'), false, 'no marker anywhere');
+});
+
+test('cache_control kept on system blocks and tool definitions when declared', () => {
+  const { body } = translateRequest({
+    system: [
+      { type: 'text', text: 'You are helpful.' },
+      { type: 'text', text: 'always do x', cache_control: { type: 'ephemeral' } },
+    ],
+    messages: [{ role: 'user', content: 'hi' }],
+    tools: [{ name: 'echo', description: 'd', input_schema: { type: 'object' }, cache_control: { type: 'ephemeral' } }],
+  }, 'm', { promptCaching: 'anthropic-ephemeral' });
+  const systemMsg = body.messages[0];
+  assert.ok(Array.isArray(systemMsg.content), 'system kept as parts to preserve breakpoints');
+  assert.deepEqual(systemMsg.content[1].cache_control, { type: 'ephemeral' });
+  assert.deepEqual(body.tools[0].cache_control, { type: 'ephemeral' }, 'tool breakpoint kept');
+});
+
+test('assistant cache_control survives only on plain-text turns (tool-call turns stay strings)', () => {
+  const { body } = translateRequest({
+    messages: [
+      { role: 'assistant', content: [{ type: 'text', text: 'prior turn', cache_control: { type: 'ephemeral' } }] },
+      { role: 'user', content: 'go' },
+    ],
+  }, 'm', { promptCaching: 'anthropic-ephemeral' });
+  assert.ok(Array.isArray(body.messages[0].content));
+  assert.deepEqual(body.messages[0].content[0].cache_control, { type: 'ephemeral' });
+});
+
+test('without markers, user content stays a joined string (unchanged behavior)', () => {
+  const { body } = translateRequest({
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }] }],
+  }, 'm', { promptCaching: 'anthropic-ephemeral' });
+  assert.equal(body.messages[0].content, 'a\nb');
+});
+
+// ─── Cached-token usage in responses (2.1) ────────────────────────────────────
+
+console.log('\ncached-token response usage');
+
+test('provider cached tokens surface as cache_read_input_tokens (never invented)', () => {
+  const res = translateResponse({
+    choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 100, completion_tokens: 10, prompt_tokens_details: { cached_tokens: 64 } },
+  }, new Map(), 'claude-x');
+  assert.equal(res.usage.cache_read_input_tokens, 64, 'real provider cache reads');
+  assert.equal(res.usage.cache_creation_input_tokens, 0, 'OpenAI-compat has no write counter — stays 0');
+});
+
+test('no cached_tokens detail → zeros, as before', () => {
+  const res = translateResponse({
+    choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 100, completion_tokens: 10 },
+  }, new Map(), 'claude-x');
+  assert.equal(res.usage.cache_read_input_tokens, 0);
+});
+
 // ─── Summary ─────────────────────────────────────────────────────────────────
 
 console.log(`\n${passed + failed} tests — ${passed} passed, ${failed} failed\n`);

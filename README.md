@@ -1,4 +1,4 @@
-![version](https://img.shields.io/badge/version-2.0.0-blue) ![node](https://img.shields.io/badge/node-18%2B-green) ![zero deps](https://img.shields.io/badge/dependencies-zero-brightgreen) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Mac%20%7C%20Linux-lightgrey) ![tests](https://img.shields.io/badge/tests-289%20passed%20%2F%2019%20suites-brightgreen) ![CI](https://github.com/jenil0528/blitz-proxy/actions/workflows/ci.yml/badge.svg)
+![version](https://img.shields.io/badge/version-2.0.0-blue) ![node](https://img.shields.io/badge/node-18%2B-green) ![zero deps](https://img.shields.io/badge/dependencies-zero-brightgreen) ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Mac%20%7C%20Linux-lightgrey) ![tests](https://img.shields.io/badge/tests-305%20passed%20%2F%2019%20suites-brightgreen) ![CI](https://github.com/jenil0528/blitz-proxy/actions/workflows/ci.yml/badge.svg)
 
 # ⚡ BlitzProxy
 
@@ -20,6 +20,8 @@ BlitzProxy works perfectly with a single provider — routing, fallback, health,
 ## Features
 
 - **Speaks both APIs natively** — Anthropic Messages (`/v1/messages`) *and* OpenAI Chat Completions + Responses (`/v1/chat/completions`, `/v1/responses`), translated in real time to any provider
+- **Extended-thinking passthrough** — Claude Code's `thinking.budget_tokens` becomes the provider's reasoning control, but ONLY when the provider declares one (OpenRouter `reasoning`, `reasoning_effort`, GLM `thinking`); never sent speculatively
+- **Prompt-caching passthrough** — Anthropic `cache_control` breakpoints survive on system/user/assistant text parts and tool definitions for providers that accept them (OpenRouter); real cached-token counts flow back as `cache_read_input_tokens` so Claude Code shows true savings; stripped safely for providers that cache automatically
 - **Multiple credentials per provider, smart rotation** — live 401/403 holds a credential out, 429 cools it down; the healthiest credential serves first, and a rejected key never poisons its provider
 - **Model registry with discovery cache** — `blitz models refresh` caches the provider's live `/models` list; capabilities are never fabricated; `GET /v1/models` serves catalog + discovered
 - **`blitz use <provider>/<model>`** — switch ONLY the model; credentials and provider config stay untouched. Aliases (`blitz alias set coding nvidia/...`) give whole routes short names
@@ -436,7 +438,7 @@ blitz config set proxyPort 4818
 ## Development
 
 ```bash
-npm test            # 289 tests, 19 suites — mocked providers behind real HTTP servers, no real keys
+npm test            # 305 tests, 19 suites — mocked providers behind real HTTP servers, no real keys
 npm run lint        # syntax check over all sources
 npm run dev         # watch-mode server
 npm run test:live   # OPT-IN live tests — set BLITZ_LIVE_TESTS=1 first; uses your real provider

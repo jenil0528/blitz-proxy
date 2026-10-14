@@ -494,7 +494,12 @@ export function createProxyServer({ keyring, stats, token }) {
       if (!baseDef) continue;
       const def = effectiveDef(baseDef, cfg);
       const adapter = getAdapter(def);
-      const { body: openaiBody, toolIdMap } = translateRequest(effectiveReq, cand.model);
+      const { body: openaiBody, toolIdMap } = translateRequest(effectiveReq, cand.model, {
+        // capability control declarations — pass through ONLY when the
+        // provider/adapter declared them; never sent speculatively
+        reasoningControl: def.models?.[cand.model]?.reasoningControl || def.reasoningControl || null,
+        promptCaching: def.promptCaching === 'anthropic-ephemeral' ? 'anthropic-ephemeral' : null,
+      });
       const started = Date.now();
 
       try {

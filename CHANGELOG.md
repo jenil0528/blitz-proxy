@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased — roadmap 2.1: reasoning + prompt-caching passthrough
+
+### Added — Extended-thinking passthrough (capability-gated, never speculative)
+- Claude Code's `thinking: {budget_tokens}` now maps to the provider's reasoning control when — and ONLY when — the provider/model declares one: `reasoningControl: 'openrouter-reasoning'` (→ `reasoning: {effort, max_tokens}`, deterministic budget→effort buckets), `'reasoning-effort'` (→ `reasoning_effort`), `'glm-thinking'` (→ `thinking: {enabled}`). Undeclared providers drop it as before (they reason on their own or not at all — no fake support).
+- Catalog: OpenRouter's reasoning-capable model declares the OpenRouter control; custom providers and plugins can declare `reasoningControl` (forwarded through the registry).
+
+### Added — Prompt-caching passthrough (honest, per-provider)
+- Anthropic `cache_control: {ephemeral}` breakpoints are preserved on system blocks, user/assistant text parts, and tool definitions when the provider declares `promptCaching: 'anthropic-ephemeral'` (OpenRouter's documented API; user config/plugins can declare it). Text with breakpoints stays per-block parts instead of collapsing to strings.
+- Response mapping: provider `prompt_tokens_details.cached_tokens` now surfaces to Claude Code as `cache_read_input_tokens` (real reads, never invented; creation stays 0 — OpenAI-compat has no write counter).
+- Providers without the declaration: markers stripped, behavior identical to before (automatic caching unaffected).
+
+### Fixed
+- Flaky keyring test: external vault writes landing in the same filesystem mtime tick as a prior persist legitimately skip the mtime-based refresh — the test now bumps the mtime explicitly, deterministic on all platforms (NTFS ticks, coarse POSIX ms).
+
+### Tests
+- 291 → **305 tests across 19 suites** — thinking→reasoning mapping (all 3 control styles + budget buckets + no-control drop), cache_control passthrough/stripping (system/user/assistant/tools), cached-token response mapping, end-to-end server integration (declaring provider receives markers + reasoning; non-declaring provider receives none).
+
 ## Unreleased — CI green + the client-side half of the image fix
 
 ### Fixed — CI was failing on ubuntu/macos (since the gateway-evolution commits)

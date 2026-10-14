@@ -58,6 +58,8 @@ New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 $cliJs = Join-Path $ProjectDir 'cli.js'
 @"
 @echo off
+:: UTF-8 codepage so CLI glyphs (checkmarks, bullets, arrows) render correctly
+chcp 65001 >nul
 node "$cliJs" %*
 "@ | Set-Content -Path $ShimPath -Encoding ASCII
 Write-Step "Created $ShimPath"

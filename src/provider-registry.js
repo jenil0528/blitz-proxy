@@ -208,6 +208,9 @@ export function resolveProvider(providerId, cfg = {}) {
       description: custom.description || 'User-defined endpoint',
       models: custom.models || {},
       pricing: custom.pricing || {},
+      // capability control declarations (forwarded from user config)
+      promptCaching: custom.promptCaching || null,
+      reasoningControl: custom.reasoningControl || null,
     };
   }
 
@@ -285,6 +288,9 @@ export async function loadPlugins(projectDir, homeDir) {
           description: raw.description || 'User plugin',
           models: raw.models || {},
           pricing: raw.pricing || {},
+          // capability control declarations (forwarded from the plugin)
+          promptCaching: raw.promptCaching || null,
+          reasoningControl: raw.reasoningControl || null,
         };
         if (!def.baseUrl) throw new Error('plugin missing baseUrl');
         const adapterFns = {};

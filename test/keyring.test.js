@@ -140,7 +140,7 @@ await test('removeKey deletes an entry by id', async () => {
 });
 
 await test('vault changes made by another process (the CLI) are picked up', async () => {
-  const { readFileSync, writeFileSync } = await import('fs');
+  const { readFileSync, writeFileSync, utimesSync } = await import('fs');
   const vaultPath = join(home, 'keys.json');
   const before = await keyring.keyCount();
   // Simulate the CLI rewriting the vault while this process (the server) runs
@@ -150,6 +150,11 @@ await test('vault changes made by another process (the CLI) are picked up', asyn
     provider: 'groq', providerName: 'Groq', createdAt: new Date().toISOString(),
   });
   writeFileSync(vaultPath, JSON.stringify(raw), 'utf-8');
+  // Force a DIFFERENT mtime: some filesystems (NTFS ticks, coarse POSIX ms)
+  // can land the external write in the same mtime tick as our previous
+  // persist, which would legitimately skip the refresh (mtime-unchanged).
+  const bumped = new Date(Date.now() + 1000);
+  utimesSync(vaultPath, bumped, bumped);
   assert.equal(await keyring.keyCount(), before + 1, 'external write must be visible after refresh');
   assert.equal(await keyring.hasProvider('groq'), true);
 });

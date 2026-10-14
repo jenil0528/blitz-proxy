@@ -76,12 +76,14 @@ other clients ──────▶  ┌────────────┐ 
 ## Request Lifecycle (Anthropic endpoint)
 
 1. `POST /v1/messages` → body read (10 MB cap) → JSON parse → 400 on invalid. A `requestId` (`BLZ-XXXXXX`) is generated per request and attached to logs, headers (`X-Blitz-Request-Id`), and error payloads.
-2. `requestNeeds()` + `estimateTokens()` → `planCandidates()` builds an ordered chain:
+2. **Context optimization** (off/safe/balanced/aggressive/custom) runs as a pure function over a copy — original preserved, errors fall back to untouched context. Reduction surfaced via `X-Blitz-Context-Reduction` + `CONTEXT` log lines.
+3. `requestNeeds()` + `estimateTokens()` → `planCandidates()` builds an ordered chain:
    - **profile active?** → profile chain (local-only profiles filtered to local providers)
    - **routing=auto?** → health-snapshot + capability + priority ranking
-   - **else** → active provider, then `fallbackChain`
+   - **else** → active provider, then `fallbackChain` (ignored entirely in STRICT mode with an explicit model)
    - Providers without credentials skipped; capability mismatches skipped **only if an alternative exists**; **one candidate per credential** in resolver order (active → healthiest → cooling → held-out).
-3. For each candidate: `translateRequest()` → `withRetry(adapter.chat())` (backoff on 429/5xx, same-provider retries). Timeout: global (if explicitly set) → model → provider → 120s default.
+   - **Vision guard**: image requests never reach models KNOWN vision-less — clear actionable 400 instead.
+4. For each candidate: `translateRequest()` (with capability-gated `reasoningControl` + `promptCaching` passthrough opts) → `withRetry(adapter.chat())` (backoff on 429/5xx, same-provider retries). Timeout: global (if explicitly set) → model → provider → 120s default.
 4. Non-OK → `classifyHttpError()`:
    - **auth (401/403)** and another credential exists for the SAME provider → mark that credential invalid (5-min hold) and rotate — not a failover, so `fallbackOnAuthError` does not gate it, and no provider health is poisoned on a successful rotation.
    - **rate limit (429)** → that credential cools down (60s); retry then failover may proceed per policy.

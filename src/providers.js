@@ -88,13 +88,16 @@ export const PROVIDERS = {
     timeout: 120000,
     headers: { 'HTTP-Referer': 'https://blitzproxy.local', 'X-Title': 'BlitzProxy' },
     description: 'Gateway to 200+ models, many free options',
+    // OpenRouter's API accepts Anthropic-style cache_control on content parts
+    // and tools, forwarding breakpoints to providers that support caching.
+    promptCaching: 'anthropic-ephemeral',
     models: {
       'meta-llama/llama-3.3-70b-instruct:free': { contextWindow: 131072, tools: true, vision: false, reasoning: false, tags: ['free', 'coding'] },
       'meta-llama/llama-3.1-405b-instruct:free': { contextWindow: 131072, tools: true, vision: false, reasoning: false, tags: ['free'] },
       'qwen/qwen-2.5-72b-instruct:free': { contextWindow: 32768, tools: true, vision: false, reasoning: false, tags: ['free'] },
       'deepseek/deepseek-chat-v3-0324:free': { contextWindow: 65536, tools: true, vision: false, reasoning: false, tags: ['free', 'coding'] },
       'google/gemini-2.0-flash-exp:free': { contextWindow: 1048576, tools: true, vision: true, reasoning: false, tags: ['free', 'vision'] },
-      'google/gemini-2.5-pro-exp-03-25:free': { contextWindow: 1048576, tools: true, vision: true, reasoning: true, tags: ['free', 'vision'] },
+      'google/gemini-2.5-pro-exp-03-25:free': { contextWindow: 1048576, tools: true, vision: true, reasoning: true, reasoningControl: 'openrouter-reasoning', tags: ['free', 'vision'] },
       'mistralai/mistral-large-2411': { contextWindow: 131072, tools: true, vision: false, reasoning: false, tags: [] },
     },
     pricing: {

@@ -65,6 +65,14 @@ export function createMockProvider({ mode = 'ok', rejectKeys = [] } = {}) {
       }
       if (m === '500') return sendJson(res, 500, { error: { message: 'server exploded' } });
       if (m === '401') return sendJson(res, 401, { error: { message: 'invalid api key' } });
+      if (m === 'ok-cached') {
+        // 200 with cached-token usage detail (prompt-caching passthrough tests)
+        return sendJson(res, 200, {
+          id: 'chatcmpl-mock',
+          choices: [{ message: { role: 'assistant', content: 'Hello from mock!' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 100, completion_tokens: 6, prompt_tokens_details: { cached_tokens: 64 } },
+        });
+      }
       if (m === '400-context') {
         return sendJson(res, 400, { error: { message: 'This model maximum context length is 4096 tokens. However, you requested 50000 tokens' } });
       }

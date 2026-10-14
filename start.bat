@@ -2,6 +2,10 @@
 title BlitzProxy
 echo.
 
+:: UTF-8 codepage so all CLI glyphs (checkmarks, bullets, arrows) render
+:: correctly instead of legacy-codepage mojibake
+chcp 65001 >nul
+
 :: Check Node.js
 node -v >nul 2>&1
 if errorlevel 1 (

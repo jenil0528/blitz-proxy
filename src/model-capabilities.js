@@ -44,7 +44,8 @@ export function getCapabilities(providerId, modelId, cfg = {}) {
     embeddings: catalog?.embeddings === true ? true : false, // chat providers: known false
     audioInput: catalog?.audioInput === true ? true : null,
     audioOutput: catalog?.audioOutput === true ? true : null,
-    promptCaching: catalog?.promptCaching === true ? true : null,
+    // provider-level declaration (e.g. OpenRouter) OR per-model metadata
+    promptCaching: catalog?.promptCaching === true || def.promptCaching === 'anthropic-ephemeral' ? true : null,
 
     // limits — null = UNKNOWN (never guessed)
     contextWindow: typeof catalog?.contextWindow === 'number' ? catalog.contextWindow : null,

@@ -21,24 +21,62 @@ function generateCallId() {
 // ─── Anthropic Request → OpenAI Request ──────────────────────────────────────
 
 /**
+ * Map an Anthropic thinking budget to a reasoning-effort bucket.
+ * Deterministic and conservative; no budget → medium.
+ */
+function budgetToEffort(budget) {
+  if (typeof budget !== 'number' || budget <= 0) return 'medium';
+  if (budget <= 4000) return 'low';
+  if (budget <= 16000) return 'medium';
+  return 'high';
+}
+
+function cacheControlOf(block) {
+  return block?.cache_control?.type === 'ephemeral' ? { type: 'ephemeral' } : null;
+}
+
+/**
  * Translate an Anthropic Messages API request body into an OpenAI Chat Completions request body.
  * @param {Object} anthropicReq - The Anthropic request body
  * @param {string} model - The model to use on the OpenAI side
+ * @param {Object} [opts]
+ * @param {string|null} [opts.reasoningControl] - provider reasoning control style declared
+ *   by the catalog/adapter: 'openrouter-reasoning' | 'reasoning-effort' | 'glm-thinking'.
+ *   Undeclared → thinking is dropped (the provider reasons on its own or not at all).
+ * @param {string|null} [opts.promptCaching] - 'anthropic-ephemeral' when the provider's
+ *   API accepts Anthropic-style cache_control on content parts / tools (e.g. OpenRouter).
+ *   Undeclared → cache_control markers are stripped (most providers cache automatically).
  * @returns {{ body: Object, toolIdMap: Map }}
  */
-export function translateRequest(anthropicReq, model) {
+export function translateRequest(anthropicReq, model, opts = {}) {
   const toolIdMap = new Map(); // anthropicId -> openaiId & reverse
   const openaiBody = {};
 
   // Model
   openaiBody.model = model;
 
+  // Extended thinking → provider reasoning control, ONLY when the provider
+  // declares a supported control style (never sent speculatively).
+  if (anthropicReq.thinking?.type === 'enabled') {
+    const control = opts.reasoningControl;
+    if (control === 'openrouter-reasoning') {
+      openaiBody.reasoning = { effort: budgetToEffort(anthropicReq.thinking.budget_tokens) };
+      const budget = anthropicReq.thinking.budget_tokens;
+      if (typeof budget === 'number' && budget > 0) openaiBody.reasoning.max_tokens = budget;
+    } else if (control === 'reasoning-effort') {
+      openaiBody.reasoning_effort = budgetToEffort(anthropicReq.thinking.budget_tokens);
+    } else if (control === 'glm-thinking') {
+      openaiBody.thinking = { type: 'enabled' };
+    }
+    // no declared control → deliberately dropped
+  }
+
   // Messages
-  openaiBody.messages = translateMessages(anthropicReq.messages || [], anthropicReq.system, toolIdMap);
+  openaiBody.messages = translateMessages(anthropicReq.messages || [], anthropicReq.system, toolIdMap, opts);
 
   // Tools
   if (anthropicReq.tools && anthropicReq.tools.length > 0) {
-    openaiBody.tools = translateToolDefinitions(anthropicReq.tools);
+    openaiBody.tools = translateToolDefinitions(anthropicReq.tools, opts);
   }
 
   // Tool choice
@@ -68,7 +106,7 @@ export function translateRequest(anthropicReq, model) {
 
 // ─── Message Translation ─────────────────────────────────────────────────────
 
-function translateMessages(messages, systemPrompt, toolIdMap) {
+function translateMessages(messages, systemPrompt, toolIdMap, opts) {
   const result = [];
 
   // System message (Anthropic puts it at top level, OpenAI as a message)
@@ -76,27 +114,43 @@ function translateMessages(messages, systemPrompt, toolIdMap) {
     if (typeof systemPrompt === 'string') {
       result.push({ role: 'system', content: systemPrompt });
     } else if (Array.isArray(systemPrompt)) {
-      // Anthropic allows system to be an array of content blocks
-      const text = systemPrompt
-        .filter(b => b.type === 'text')
-        .map(b => b.text)
-        .join('\n');
-      if (text) result.push({ role: 'system', content: text });
+      // Anthropic allows system to be an array of content blocks.
+      // With prompt-caching passthrough enabled, keep blocks (with their
+      // cache_control breakpoints) as parts; otherwise collapse to a string.
+      const caching = opts?.promptCaching === 'anthropic-ephemeral';
+      const hasCache = systemPrompt.some(b => b?.cache_control?.type === 'ephemeral');
+      if (caching && hasCache) {
+        const parts = systemPrompt
+          .filter(b => b.type === 'text')
+          .map(b => {
+            const part = { type: 'text', text: b.text };
+            const cc = cacheControlOf(b);
+            if (cc) part.cache_control = cc;
+            return part;
+          });
+        if (parts.length > 0) result.push({ role: 'system', content: parts });
+      } else {
+        const text = systemPrompt
+          .filter(b => b.type === 'text')
+          .map(b => b.text)
+          .join('\n');
+        if (text) result.push({ role: 'system', content: text });
+      }
     }
   }
 
   for (const msg of messages) {
     if (msg.role === 'user') {
-      result.push(...translateUserMessage(msg, toolIdMap));
+      result.push(...translateUserMessage(msg, toolIdMap, opts));
     } else if (msg.role === 'assistant') {
-      result.push(...translateAssistantMessage(msg, toolIdMap));
+      result.push(...translateAssistantMessage(msg, toolIdMap, opts));
     }
   }
 
   return result;
 }
 
-function translateUserMessage(msg, toolIdMap) {
+function translateUserMessage(msg, toolIdMap, opts) {
   const results = [];
 
   // Content can be a string or array of content blocks
@@ -148,13 +202,25 @@ function translateUserMessage(msg, toolIdMap) {
     });
   }
 
-  // Other content blocks → user message (text + vision parts)
+  // Other content blocks → user message (text + vision parts).
+  // With prompt-caching passthrough, cache_control breakpoints are kept on
+  // per-block text parts; otherwise text collapses to a plain string.
   if (otherBlocks.length > 0) {
+    const caching = opts?.promptCaching === 'anthropic-ephemeral';
+    const hasCache = caching && otherBlocks.some(b => b?.cache_control?.type === 'ephemeral');
     const textParts = [];
     const imageParts = [];
+    let cacheOnText = false;
     for (const block of otherBlocks) {
       if (block.type === 'text') {
-        textParts.push(block.text);
+        if (hasCache) {
+          const part = { type: 'text', text: block.text };
+          const cc = cacheControlOf(block);
+          if (cc) { part.cache_control = cc; cacheOnText = true; }
+          textParts.push(part);
+        } else {
+          textParts.push(block.text);
+        }
       } else if (block.type === 'image' && block.source) {
         // Anthropic image → OpenAI image_url (base64 data URL or remote URL)
         if (block.source.type === 'base64' && block.source.data) {
@@ -170,18 +236,28 @@ function translateUserMessage(msg, toolIdMap) {
 
     if (imageParts.length > 0) {
       const parts = [];
-      if (textParts.length > 0) parts.push({ type: 'text', text: textParts.join('\n') });
+      if (textParts.length > 0) {
+        if (typeof textParts[0] === 'string') {
+          parts.push({ type: 'text', text: textParts.join('\n') });
+        } else {
+          parts.push(...textParts);
+        }
+      }
       parts.push(...imageParts);
       results.push({ role: 'user', content: parts });
     } else if (textParts.length > 0) {
-      results.push({ role: 'user', content: textParts.join('\n') });
+      if (cacheOnText) {
+        results.push({ role: 'user', content: textParts }); // parts array keeps breakpoints
+      } else {
+        results.push({ role: 'user', content: textParts.join('\n') });
+      }
     }
   }
 
   return results;
 }
 
-function translateAssistantMessage(msg, toolIdMap) {
+function translateAssistantMessage(msg, toolIdMap, opts) {
   // Content can be a string or array of content blocks
   if (typeof msg.content === 'string') {
     return [{ role: 'assistant', content: msg.content }];
@@ -191,9 +267,14 @@ function translateAssistantMessage(msg, toolIdMap) {
     return [{ role: 'assistant', content: String(msg.content || '') }];
   }
 
-  // Build a single assistant message with optional tool_calls
+  // Build a single assistant message with optional tool_calls.
+  // cache_control breakpoints survive only on plain-text turns — a
+  // tool-call turn must keep a string content part for provider compatibility.
   const assistantMsg = { role: 'assistant', content: null, tool_calls: [] };
   const textParts = [];
+  const caching = opts?.promptCaching === 'anthropic-ephemeral';
+  const hasCache = caching && msg.content.some(b => b?.cache_control?.type === 'ephemeral');
+  let sawToolUse = false;
 
   for (const block of msg.content) {
     if (block.type === 'thinking' || block.type === 'redacted_thinking') {
@@ -201,8 +282,16 @@ function translateAssistantMessage(msg, toolIdMap) {
       continue;
     }
     if (block.type === 'text') {
-      textParts.push(block.text);
+      if (hasCache) {
+        const part = { type: 'text', text: block.text };
+        const cc = cacheControlOf(block);
+        if (cc) part.cache_control = cc;
+        textParts.push(part);
+      } else {
+        textParts.push(block.text);
+      }
     } else if (block.type === 'tool_use') {
+      sawToolUse = true;
       const callId = generateCallId();
       toolIdMap.set(block.id, callId); // anthropic → openai
       toolIdMap.set(callId, block.id); // openai → anthropic (reverse)
@@ -219,7 +308,11 @@ function translateAssistantMessage(msg, toolIdMap) {
   }
 
   if (textParts.length > 0) {
-    assistantMsg.content = textParts.join('\n');
+    if (hasCache && !sawToolUse && typeof textParts[0] !== 'string') {
+      assistantMsg.content = textParts; // parts array keeps breakpoints
+    } else {
+      assistantMsg.content = textParts.map(p => (typeof p === 'string' ? p : p.text)).join('\n');
+    }
   }
 
   if (assistantMsg.tool_calls.length === 0) {
@@ -231,15 +324,23 @@ function translateAssistantMessage(msg, toolIdMap) {
 
 // ─── Tool Definition Translation ─────────────────────────────────────────────
 
-function translateToolDefinitions(tools) {
-  return tools.map(tool => ({
-    type: 'function',
-    function: {
-      name: tool.name,
-      description: tool.description || '',
-      parameters: tool.input_schema || { type: 'object', properties: {} },
-    },
-  }));
+function translateToolDefinitions(tools, opts) {
+  const caching = opts?.promptCaching === 'anthropic-ephemeral';
+  return tools.map(tool => {
+    const def = {
+      type: 'function',
+      function: {
+        name: tool.name,
+        description: tool.description || '',
+        parameters: tool.input_schema || { type: 'object', properties: {} },
+      },
+    };
+    // Anthropic puts cache_control on the tool object; OpenRouter-style APIs
+    // accept it at the same level. Pass through only when declared.
+    const cc = caching ? cacheControlOf(tool) : null;
+    if (cc) def.cache_control = cc;
+    return def;
+  });
 }
 
 function translateToolChoice(choice) {
@@ -353,8 +454,11 @@ function buildAnthropicResponse(content, stopReason, model, usage) {
     usage: {
       input_tokens: usage?.prompt_tokens || usage?.input_tokens || 0,
       output_tokens: usage?.completion_tokens || usage?.output_tokens || 0,
+      // Real provider cache reads when reported (OpenAI-compat
+      // prompt_tokens_details.cached_tokens); 0 otherwise — never invented.
+      // OpenAI-compat APIs have no "cache write" counter, so creation stays 0.
       cache_creation_input_tokens: 0,
-      cache_read_input_tokens: 0,
+      cache_read_input_tokens: usage?.prompt_tokens_details?.cached_tokens || 0,
     },
   };
 }

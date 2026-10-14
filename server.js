@@ -56,18 +56,22 @@ async function main() {
   });
 
   server.listen(cfg.proxyPort, cfg.host, () => {
-    const keyringLabel = keyringMode === 'file' ? `${keyringMode} (⚠ plaintext fallback)` : keyringMode;
+    const keyringLabel = keyringMode === 'file' ? `${keyringMode} (WARNING: plaintext fallback)` : keyringMode;
+    // Banner is pure ASCII: the server can be launched from ANY console
+    // (cmd.exe with a legacy codepage, services, start.bat) and multi-byte
+    // glyphs would render as mojibake there (TÇo / [Ço). Keep it clean
+    // everywhere; the interactive CLI can afford glyphs via the UTF-8 shim.
     log.banner([
-      `${'\x1b[1m'}⚡ BlitzProxy v${VERSION}${'\x1b[0m'}  —  Local AI Provider Gateway`,
+      `${'\x1b[1m'}BlitzProxy v${VERSION} - local-first multi-provider AI gateway${'\x1b[0m'}`,
       '',
       `  Listen:    ${'\x1b[33m'}http://${cfg.host}:${cfg.proxyPort}${'\x1b[0m'}`,
-      `  Provider:  ${'\x1b[32m'}${active.def?.name || active.providerId}${'\x1b[0m'}${active.model ? `  •  ${active.model}` : ''}`,
-      `  Routing:   ${cfg.profile ? 'profile:' + cfg.profile : cfg.routing}${cfg.fallbackChain?.length ? '  •  fallback: ' + cfg.fallbackChain.join(' → ') : ''}`,
+      `  Provider:  ${'\x1b[32m'}${active.def?.name || active.providerId}${'\x1b[0m'}${active.model ? `  |  ${active.model}` : ''}`,
+      `  Routing:   ${cfg.profile ? 'profile:' + cfg.profile : cfg.routing}${cfg.fallbackChain?.length ? '  |  fallback: ' + cfg.fallbackChain.join(' -> ') : ''}`,
       `  Keyring:   ${keyringLabel}`,
-      `  Auth:      /v1 ${cfg.requireAuth ? 'token required' : 'open (localhost only)'}  •  /admin + /dashboard: token required`,
-      `  Privacy:   ${cfg.privacy ? 'ON — request logging disabled' : 'off — aggregate logs only, no prompts'}`,
+      `  Auth:      /v1 ${cfg.requireAuth ? 'token required' : 'open (localhost only)'}  |  /admin + /dashboard: token required`,
+      `  Privacy:   ${cfg.privacy ? 'ON - request logging disabled' : 'off - aggregate logs only, no prompts'}`,
       '',
-      `  ${'\x1b[2m'}Claude Code: blitz run claude   •   Dashboard: blitz dashboard${'\x1b[0m'}`,
+      `  ${'\x1b[2m'}Claude Code: blitz run claude   |   Dashboard: blitz dashboard${'\x1b[0m'}`,
     ]);
 
     try {

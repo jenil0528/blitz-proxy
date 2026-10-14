@@ -49,7 +49,8 @@ writeFileSync(process.env.BLITZ_CONFIG, JSON.stringify({
       defaultModel: 'mock/model-a',
       requiresKey: true,
       timeout: 8000,
-      models: { 'mock/model-a': { contextWindow: 8192, tools: true, vision: true, reasoning: true, tags: [] } },
+      promptCaching: 'anthropic-ephemeral',
+      models: { 'mock/model-a': { contextWindow: 8192, tools: true, vision: true, reasoning: true, reasoningControl: 'openrouter-reasoning', tags: [] } },
     },
     mockb: {
       name: 'Mock B',
@@ -457,6 +458,52 @@ await test('/admin/sessions returns recovery metadata with counts (token-gated)'
   for (const s of data.sessions) {
     assert.equal(s.pid, undefined, 'process ids are never exposed over HTTP');
     assert.ok(!JSON.stringify(s).includes('nvapi-'), 'no key material ever');
+  }
+});
+
+await test('thinking + cache_control flow through to a declaring provider, cached usage returns to the client', async () => {
+  try {
+    mockA.setMode('ok-cached');
+    const res = await post('/v1/messages', JSON.stringify({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 50,
+      thinking: { type: 'enabled', budget_tokens: 5000 },
+      system: [{ type: 'text', text: 'sys prompt', cache_control: { type: 'ephemeral' } }],
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi', cache_control: { type: 'ephemeral' } }] }],
+    }));
+    assert.equal(res.status, 200);
+    const data = await res.json();
+    assert.equal(data.usage.cache_read_input_tokens, 64, 'cached tokens surfaced to the client');
+
+    // The upstream mock received the translated reasoning + cache markers
+    const sent = mockA.requests[mockA.requests.length - 1].body;
+    assert.equal(sent.reasoning?.effort, 'medium', 'thinking budget → reasoning.effort');
+    assert.equal(sent.reasoning?.max_tokens, 5000);
+    const sys = sent.messages[0];
+    assert.ok(Array.isArray(sys.content) && sys.content[0].cache_control?.type === 'ephemeral',
+      'system cache_control preserved as parts');
+    const user = sent.messages[1];
+    assert.ok(Array.isArray(user.content) && user.content[0].cache_control?.type === 'ephemeral',
+      'user cache_control preserved');
+  } finally {
+    mockA.setMode('ok');
+  }
+});
+
+await test('cache_control is stripped for providers that do not declare caching', async () => {
+  try {
+    saveConfig({ provider: 'mockc', model: 'mock/model-c', fallbackChain: [], profile: '' });
+    const res = await post('/v1/messages', JSON.stringify({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 50,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi', cache_control: { type: 'ephemeral' } }] }],
+    }));
+    assert.equal(res.status, 200);
+    const sent = mockC.requests[mockC.requests.length - 1].body;
+    assert.equal(JSON.stringify(sent).includes('cache_control'), false, 'no cache markers sent');
+    assert.equal(sent.messages[0].content, 'hi', 'plain string as before');
+  } finally {
+    saveConfig({ provider: 'mocka', model: 'mock/model-a', fallbackChain: ['mockb'], profile: '' });
   }
 });
 
